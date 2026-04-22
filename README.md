@@ -80,3 +80,7 @@ The index file (`godette_sessions.json`) holds per-session metadata; each thread
 - Transport is ACP over stdio, matching Zed's external-agent design. No HTTP, no separate bridge process.
 - Streamed output and session isolation are fully working. Multi-session parallel turns, queued prompts, and mid-stream cancellation all handled.
 - File edit review is still minimal — permission requests are shown but the diff UX is much simpler than Zed's side-by-side review. That's on the roadmap.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
