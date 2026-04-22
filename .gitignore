@@ -1,0 +1,23 @@
+# Godot 4+ specific ignores
+.godot/
+/android/
+*.translation
+
+# Vendored reference sources (not shipped)
+/vendor/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Backups & scratch
+*.bak
+*.tmp
+*.orig
