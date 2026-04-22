@@ -1,3 +1,5 @@
+<img width="1672" height="941" alt="ChatGPT Image 2026年4月22日 06_27_35" src="https://github.com/user-attachments/assets/501fa074-759c-41fa-966c-e3ea2377f468" />
+
 # Agent Godette
 
 _v0.1.0 — Godot 4.6_
