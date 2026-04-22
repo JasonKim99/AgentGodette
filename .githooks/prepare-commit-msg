@@ -1,0 +1,40 @@
+#!/bin/sh
+# Automatically append Claude / Codex co-author trailers to commit messages.
+# Idempotent: won't duplicate if trailers are already present.
+# Skipped for merge / squash commits so existing history is preserved.
+
+COMMIT_MSG_FILE="$1"
+COMMIT_SOURCE="$2"
+
+case "$COMMIT_SOURCE" in
+    merge|squash)
+        exit 0
+        ;;
+esac
+
+CLAUDE_TRAILER="Co-Authored-By: Claude <noreply@anthropic.com>"
+CODEX_TRAILER="Co-Authored-By: OpenAI Codex <noreply@openai.com>"
+
+MSG_BODY=$(grep -v '^#' "$COMMIT_MSG_FILE" | sed -e 's/[[:space:]]*$//')
+if [ -z "$MSG_BODY" ]; then
+    exit 0
+fi
+
+append_trailer() {
+    trailer="$1"
+    email=$(printf '%s' "$trailer" | sed -n 's/.*<\(.*\)>.*/\1/p')
+    if ! grep -qF "$email" "$COMMIT_MSG_FILE"; then
+        last_char=$(tail -c 1 "$COMMIT_MSG_FILE" 2>/dev/null)
+        if [ -n "$last_char" ] && [ "$last_char" != "
+" ]; then
+            printf '\n' >> "$COMMIT_MSG_FILE"
+        fi
+        if ! tail -n 2 "$COMMIT_MSG_FILE" | grep -q "^Co-Authored-By:"; then
+            printf '\n' >> "$COMMIT_MSG_FILE"
+        fi
+        printf '%s\n' "$trailer" >> "$COMMIT_MSG_FILE"
+    fi
+}
+
+append_trailer "$CLAUDE_TRAILER"
+append_trailer "$CODEX_TRAILER"
