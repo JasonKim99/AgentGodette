@@ -6,6 +6,9 @@
 # Vendored reference sources (not shipped)
 /vendor/
 
+# Local prototypes / scratch scenes (not shipped)
+/prototypes/pong/
+
 # OS
 .DS_Store
 Thumbs.db
