@@ -16,6 +16,10 @@ signal permission_requested(agent_id: String, request_id: int, params: Dictionar
 signal transport_status(agent_id: String, status: String)
 signal protocol_error(agent_id: String, message: String)
 signal stderr_output(agent_id: String, line: String)
+# Fires after a successful fs/write_text_file handler. The dock uses this to
+# poke Godot's EditorFileSystem so freshly written files appear in the
+# FileSystem dock without waiting for the next editor-focus scan.
+signal fs_write_completed(agent_id: String, path: String)
 
 const JSONRPC_VERSION := "2.0"
 const PROTOCOL_VERSION := 1
@@ -489,6 +493,7 @@ func _handle_fs_write_text_file(request_id: int, params: Dictionary) -> void:
 		"id": request_id,
 		"result": {}
 	})
+	emit_signal("fs_write_completed", agent_id, path)
 
 
 # Quick UTF-8 well-formedness check. Avoids shipping PNG / binary bytes

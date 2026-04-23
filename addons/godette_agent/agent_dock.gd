@@ -155,6 +155,7 @@ var startup_discovery_agents := {}
 var persist_timer: Timer
 var persist_dirty := false
 var managed_attachment_cleanup_pending := false
+var editor_fs_scan_pending := false
 
 
 func configure(p_editor_interface: EditorInterface) -> void:
@@ -2971,6 +2972,7 @@ func _ensure_connection(agent_id: String):
 	connection.transport_status.connect(Callable(self, "_on_connection_transport_status"))
 	connection.protocol_error.connect(Callable(self, "_on_connection_protocol_error"))
 	connection.stderr_output.connect(Callable(self, "_on_connection_stderr_output"))
+	connection.fs_write_completed.connect(Callable(self, "_on_connection_fs_write_completed"))
 
 	connections[agent_id] = connection
 	connection_status[agent_id] = "starting"
@@ -3422,6 +3424,11 @@ func _on_connection_prompt_finished(agent_id: String, remote_session_id: String,
 		_update_entry_in_feed(prev_assistant_entry_index)
 	_dispatch_next_prompt(session_index)
 	_refresh_send_state()
+	# Bash-initiated file writes (mkdir, cp, sed, etc.) bypass our
+	# fs/write_text_file path and its targeted signal, so do a
+	# catch-all scan once the turn ends. Coalesced with any per-write
+	# scans already scheduled this frame.
+	_schedule_editor_fs_scan()
 	_refresh_status()
 
 
@@ -3517,6 +3524,36 @@ func _on_connection_stderr_output(agent_id: String, line: String) -> void:
 	if "error" in line.to_lower() or "failed" in line.to_lower():
 		_append_system_message_to_agent(agent_id, line)
 	_refresh_status()
+
+
+func _on_connection_fs_write_completed(_agent_id: String, _path: String) -> void:
+	# Our fs/write_text_file handler drops bytes straight to disk, bypassing
+	# Godot's resource system. The FileSystem dock only rescans on editor
+	# focus, so newly created files wouldn't appear until the user clicked
+	# away and back. Schedule a deferred scan_changes to pick them up.
+	_schedule_editor_fs_scan()
+
+
+# Coalesces bursts of filesystem changes (Write batches, prompt_finished
+# sweeps) into a single EditorFileSystem.scan_changes call per frame.
+# scan_changes is cheap relative to a full scan() — only new / modified /
+# deleted files are re-evaluated — but there's no reason to fire it more
+# than once per batch of writes.
+func _schedule_editor_fs_scan() -> void:
+	if editor_fs_scan_pending:
+		return
+	editor_fs_scan_pending = true
+	call_deferred("_run_editor_fs_scan")
+
+
+func _run_editor_fs_scan() -> void:
+	editor_fs_scan_pending = false
+	if editor_interface == null:
+		return
+	var fs := editor_interface.get_resource_filesystem()
+	if fs == null:
+		return
+	fs.scan_changes()
 
 
 func _permission_option_label(option: Dictionary) -> String:

@@ -2,7 +2,7 @@
 
 # Agent Godette
 
-_v0.2.0 — Godot 4.6_
+_v0.2.1 — Godot 4.6_
 <img width="3840" height="2076" alt="image" src="https://github.com/user-attachments/assets/807fc791-77de-40ad-a085-b906d7ef7154" />
 
 A Godot 4 editor plugin that talks to local ACP (Agent Client Protocol) adapters — the same transport Zed uses for external agents. Godot is the client; Claude and Codex run as local stdio subprocesses; no HTTP bridge.
@@ -90,6 +90,7 @@ The index file (`godette_sessions.json`) holds per-session metadata; each thread
 - Transport is ACP over stdio, matching Zed's external-agent design. No HTTP, no separate bridge process.
 - Streamed output and session isolation are fully working. Multi-session parallel turns, queued prompts, and mid-stream cancellation all handled.
 - **Transcript cache is the source of truth** (mirrors Zed's SQLite-backed approach): the on-disk per-thread JSON files are authoritative, and `session/load` replay events from reconnecting adapters are suppressed so they don't double-append on top of cached history.
+- **Editor FileSystem auto-refresh**: after the agent writes a file (via `fs/write_text_file`) or finishes a turn (catching Bash-initiated writes), Godette pokes `EditorFileSystem.scan_changes()` so new files show up in the FileSystem dock without having to switch tabs and back. `project.godot` still triggers Godot's built-in "reload / ignore" prompt when the agent modifies it — that's a safety feature we can't suppress; nudge the agent to avoid touching `project.godot` unless necessary.
 - **Image attachments are attached as file references, not inline vision.** claude-code-acp routes all file reads through `fs/read_text_file` which is UTF-8-only, so binary bytes (PNG etc.) can't round-trip as inline base64 ImageContent reliably. Pasted screenshots are saved to disk and sent as `resource_link` — the agent surfaces a clear "can't read binary" message when it tries to read them. Describe the image in prose if the model needs to "see" it.
 - `fs/read_text_file` uses the static `FileAccess.get_file_as_bytes` path to avoid a Godot quirk where holding an instance `FileAccess.open` handle on a file the editor also has open poisons the stdio pipe's internal state.
 - File edit review is still minimal — permission requests are shown but the diff UX is much simpler than Zed's side-by-side review. That's on the roadmap.
