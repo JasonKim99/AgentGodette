@@ -178,7 +178,8 @@ static func write_thread_cache(session: Dictionary) -> void:
 	var payload: Dictionary = {
 		"id": session_id,
 		"transcript": compact_transcript(session.get("transcript", [])),
-		"attachments": session.get("attachments", [])
+		"attachments": session.get("attachments", []),
+		"managed_attachment_refs": session.get("managed_attachment_refs", []),
 	}
 	var file := FileAccess.open(thread_cache_path(session_id), FileAccess.WRITE)
 	if file == null:
@@ -234,8 +235,10 @@ static func hydrate(session: Dictionary) -> void:
 	var cache: Dictionary = read_thread_cache(session_id)
 	var cached_transcript_variant = cache.get("transcript", [])
 	var cached_attachments_variant = cache.get("attachments", [])
+	var cached_managed_attachment_refs = cache.get("managed_attachment_refs", [])
 	session["transcript"] = cached_transcript_variant if cached_transcript_variant is Array else []
 	session["attachments"] = cached_attachments_variant if cached_attachments_variant is Array else []
+	session["managed_attachment_refs"] = cached_managed_attachment_refs if cached_managed_attachment_refs is Array else []
 	session["assistant_entry_index"] = -1
 	session["thought_entry_index"] = -1
 	session["plan_entry_index"] = -1
@@ -283,6 +286,7 @@ static func restored_session(
 		"loading_remote_session": false,
 		"creating_remote_session": false,
 		"attachments": [],
+		"managed_attachment_refs": [],
 		"transcript": [],
 		"assistant_entry_index": -1,
 		"thought_entry_index": -1,
@@ -415,6 +419,15 @@ static func compact_transcript(transcript_variant) -> Array:
 
 		if entry.has("items"):
 			compact_entry["items"] = compact_plan_items(entry.get("items", []))
+
+		# User bubble's inline chip layout. Stored as pure JSON segments
+		# (text runs + chip references). Round-trips as-is so transcripts
+		# reloaded from disk render with the same inline chips the user
+		# originally sent.
+		if entry.has("segments"):
+			var segments_variant = entry.get("segments", [])
+			if segments_variant is Array:
+				compact_entry["segments"] = segments_variant
 
 		compacted_transcript.append(compact_entry)
 

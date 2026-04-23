@@ -24,3 +24,7 @@ desktop.ini
 *.bak
 *.tmp
 *.orig
+
+# Godette: pasted clipboard images + drag-dropped blobs. Per-machine
+# scratch, not project content.
+/addons/godette_agent/attachments/

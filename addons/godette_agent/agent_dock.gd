@@ -10,7 +10,11 @@ const VirtualFeedScript = preload("res://addons/godette_agent/virtual_feed.gd")
 const LoadingScannerScript = preload("res://addons/godette_agent/loading_scanner.gd")
 const ComposerContextScript = preload("res://addons/godette_agent/composer_context.gd")
 const ComposerPromptInputScript = preload("res://addons/godette_agent/composer_prompt_input.gd")
-const PASTED_IMAGE_DIR := "user://godette_attachments/"
+const ComposerChipOverlayScript = preload("res://addons/godette_agent/composer_chip_overlay.gd")
+# Store pasted images under the addon itself so every generated attachment
+# stays in one predictable project-local place. Keep the directory visible
+# (no leading dot) because Claude Code's file layer can skip hidden paths.
+const PASTED_IMAGE_DIR := "res://addons/godette_agent/attachments/"
 const CLAUDE_AGENT_ICON = preload("res://addons/godette_agent/icons/claude.svg")
 const CODEX_CLI_ICON = preload("res://addons/godette_agent/icons/openai.svg")
 const SEND_ICON = preload("res://addons/godette_agent/icons/send.svg")
@@ -63,7 +67,7 @@ var message_scroll: ScrollContainer
 var message_stream: GodetteVirtualFeed
 var prompt_input: TextEdit
 var composer_options_bar: HBoxContainer
-var composer_context: GodetteComposerContext
+var composer_chip_overlay: GodetteComposerChipOverlay
 var send_button: Button
 # Left-aligned badge in composer_options_bar showing how many follow-up
 # prompts are queued behind the current streaming turn. Hidden when the
@@ -150,6 +154,7 @@ var selected_agent_id := DEFAULT_AGENT_ID
 var startup_discovery_agents := {}
 var persist_timer: Timer
 var persist_dirty := false
+var managed_attachment_cleanup_pending := false
 
 
 func configure(p_editor_interface: EditorInterface) -> void:
@@ -334,6 +339,7 @@ func _ready() -> void:
 	# user at least sees their threads while the adapter warms up in the
 	# background.
 	_restore_persisted_state()
+	_schedule_managed_attachment_cleanup()
 	call_deferred("_begin_session_discovery")
 
 
@@ -351,6 +357,7 @@ func shutdown() -> void:
 	if persist_timer != null and is_instance_valid(persist_timer):
 		persist_timer.stop()
 	_flush_persist_state()
+	_cleanup_managed_attachments()
 	for connection in connections.values():
 		if is_instance_valid(connection):
 			connection.shutdown()
@@ -464,28 +471,14 @@ func _build_ui() -> void:
 	message_stream.entry_created.connect(Callable(self, "_on_virtual_feed_entry_created"))
 	message_stream.entry_freed.connect(Callable(self, "_on_virtual_feed_entry_freed"))
 
-	# Composer frame: a single bordered surface that hosts both the chip
-	# strip and the text input. Zed's "chips inside the input" look is
-	# actually two sibling controls sharing one outer border — same trick
-	# here. The frame carries the border/background; the TextEdit below is
-	# flattened so the frame shows through.
+	# Composer frame: a single bordered surface that hosts the text input
+	# directly. Attachments appear INLINE as chips drawn by the overlay (a
+	# child of prompt_input) so the old separate chip strip is gone — the
+	# user sees one unified editor where chips feel like characters.
 	var composer_frame := PanelContainer.new()
 	composer_frame.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	composer_frame.add_theme_stylebox_override("panel", _prompt_input_style(false))
 	add_child(composer_frame)
-
-	var composer_input_group := VBoxContainer.new()
-	composer_input_group.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	composer_input_group.add_theme_constant_override("separation", 6)
-	composer_frame.add_child(composer_input_group)
-
-	composer_context = ComposerContextScript.new()
-	composer_context.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	composer_context.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-	composer_context.visible = false
-	composer_context.attachment_remove_requested.connect(Callable(self, "_on_attachment_remove_requested"))
-	composer_context.attachment_activated.connect(Callable(self, "_on_attachment_activated"))
-	composer_input_group.add_child(composer_context)
 
 	# Use a local typed ref so the `image_pasted` signal connection resolves
 	# through the subclass statically. Assigning the member `prompt_input`
@@ -496,6 +489,7 @@ func _build_ui() -> void:
 	var typed_prompt: GodetteComposerPromptInput = ComposerPromptInputScript.new()
 	typed_prompt.image_pasted.connect(Callable(self, "_on_composer_image_pasted"))
 	typed_prompt.submit_requested.connect(Callable(self, "_on_composer_submit_requested"))
+	typed_prompt.chips_changed.connect(Callable(self, "_on_composer_chips_changed"))
 	prompt_input = typed_prompt
 	prompt_input.custom_minimum_size = Vector2(0, 120)
 	prompt_input.placeholder_text = _prompt_placeholder(DEFAULT_AGENT_ID)
@@ -510,6 +504,11 @@ func _build_ui() -> void:
 	prompt_input.add_theme_color_override("font_placeholder_color", prompt_placeholder_color)
 	prompt_input.add_theme_color_override("caret_color", prompt_caret)
 	prompt_input.add_theme_color_override("selection_color", prompt_selection)
+	# Wrap long lines (including chip runs whose NBSP padding can push a
+	# line wide) so the horizontal scrollbar never appears. Inline chips
+	# already wrap-resist via non-breaking spaces — LINE_WRAPPING_BOUNDARY
+	# just handles the plain-text case on the same side of the chip.
+	prompt_input.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
 	# Flat styleboxes so only composer_frame draws the border/background.
 	# Without this, the TextEdit would render its own box inside the frame
 	# and the chip strip would look like it's floating above a separate
@@ -544,7 +543,16 @@ func _build_ui() -> void:
 		Callable(self, "_composer_can_drop"),
 		Callable(self, "_composer_drop")
 	)
-	composer_input_group.add_child(prompt_input)
+	composer_frame.add_child(prompt_input)
+
+	# Overlay paints inline chips on top of the TextEdit. Because it's a
+	# child of prompt_input with full anchors, its local coordinates line
+	# up with `TextEdit.get_rect_at_line_column`, so rect math stays
+	# trivial. Chip clicks bubble out through its signal; unhandled mouse
+	# events fall through to TextEdit for normal caret/selection work.
+	composer_chip_overlay = ComposerChipOverlayScript.new(typed_prompt)
+	composer_chip_overlay.chip_activated.connect(Callable(self, "_on_attachment_activated"))
+	prompt_input.add_child(composer_chip_overlay)
 
 	var composer_section := VBoxContainer.new()
 	composer_section.add_theme_constant_override("separation", 6)
@@ -646,6 +654,137 @@ func _flush_persist_state() -> void:
 		return
 	persist_dirty = false
 	_persist_state()
+
+
+func _managed_attachment_dir_path() -> String:
+	return ProjectSettings.globalize_path(PASTED_IMAGE_DIR).replace("\\", "/").trim_suffix("/")
+
+
+func _attachment_absolute_path(path: String) -> String:
+	if path.is_empty():
+		return ""
+	var absolute_path := path
+	if path.begins_with("res://") or path.begins_with("user://"):
+		absolute_path = ProjectSettings.globalize_path(path)
+	return _normalized_path(absolute_path)
+
+
+func _managed_attachment_absolute_path(path: String) -> String:
+	var absolute_path := _attachment_absolute_path(path)
+	if absolute_path.is_empty():
+		return ""
+	var managed_dir := _normalized_path(_managed_attachment_dir_path())
+	if not absolute_path.begins_with(managed_dir + "/"):
+		return ""
+	var managed_file := absolute_path.get_file()
+	if not managed_file.begins_with("clip_") or managed_file.get_extension().to_lower() != "png":
+		return ""
+	return absolute_path
+
+
+func _append_managed_attachment_ref(path: String, merged: Array, seen: Dictionary) -> void:
+	var managed_path := _managed_attachment_absolute_path(path)
+	if managed_path.is_empty() or seen.has(managed_path):
+		return
+	seen[managed_path] = true
+	merged.append(managed_path)
+
+
+func _managed_attachment_refs_from_attachments(attachments_variant: Variant) -> Array:
+	var refs: Array = []
+	var seen: Dictionary = {}
+	if typeof(attachments_variant) != TYPE_ARRAY:
+		return refs
+	for attachment_variant in attachments_variant:
+		if typeof(attachment_variant) != TYPE_DICTIONARY:
+			continue
+		var attachment: Dictionary = attachment_variant
+		_append_managed_attachment_ref(str(attachment.get("path", "")), refs, seen)
+	return refs
+
+
+func _merge_managed_attachment_refs(existing_variant: Variant, attachments_variant: Variant) -> Array:
+	var merged: Array = []
+	var seen: Dictionary = {}
+	if typeof(existing_variant) == TYPE_ARRAY:
+		for path_variant in existing_variant:
+			_append_managed_attachment_ref(str(path_variant), merged, seen)
+	for path_variant in _managed_attachment_refs_from_attachments(attachments_variant):
+		_append_managed_attachment_ref(str(path_variant), merged, seen)
+	return merged
+
+
+func _mark_managed_attachment_paths(attachments_variant: Variant, referenced: Dictionary) -> void:
+	if typeof(attachments_variant) != TYPE_ARRAY:
+		return
+	for attachment_variant in attachments_variant:
+		if typeof(attachment_variant) != TYPE_DICTIONARY:
+			continue
+		var attachment: Dictionary = attachment_variant
+		var managed_path := _managed_attachment_absolute_path(str(attachment.get("path", "")))
+		if managed_path.is_empty():
+			continue
+		referenced[managed_path] = true
+
+
+func _mark_managed_attachment_refs(refs_variant: Variant, referenced: Dictionary) -> void:
+	if typeof(refs_variant) != TYPE_ARRAY:
+		return
+	for path_variant in refs_variant:
+		var managed_path := _managed_attachment_absolute_path(str(path_variant))
+		if managed_path.is_empty():
+			continue
+		referenced[managed_path] = true
+
+
+func _collect_referenced_managed_attachment_paths() -> Dictionary:
+	var referenced: Dictionary = {}
+	for session_variant in sessions:
+		if typeof(session_variant) != TYPE_DICTIONARY:
+			continue
+		var session: Dictionary = session_variant
+		_mark_managed_attachment_paths(session.get("attachments", []), referenced)
+		_mark_managed_attachment_refs(session.get("managed_attachment_refs", []), referenced)
+		if bool(session.get("hydrated", false)):
+			continue
+		var session_id := str(session.get("id", ""))
+		if session_id.is_empty():
+			continue
+		var thread_cache: Dictionary = SessionStoreScript.read_thread_cache(session_id)
+		_mark_managed_attachment_paths(thread_cache.get("attachments", []), referenced)
+		_mark_managed_attachment_refs(thread_cache.get("managed_attachment_refs", []), referenced)
+	return referenced
+
+
+func _schedule_managed_attachment_cleanup() -> void:
+	if managed_attachment_cleanup_pending:
+		return
+	managed_attachment_cleanup_pending = true
+	call_deferred("_cleanup_managed_attachments")
+
+
+func _cleanup_managed_attachments() -> void:
+	managed_attachment_cleanup_pending = false
+	var managed_dir_path := _managed_attachment_dir_path()
+	if not DirAccess.dir_exists_absolute(managed_dir_path):
+		return
+	var dir := DirAccess.open(managed_dir_path)
+	if dir == null:
+		return
+
+	var referenced := _collect_referenced_managed_attachment_paths()
+	dir.list_dir_begin()
+	var entry_name := dir.get_next()
+	while not entry_name.is_empty():
+		if not dir.current_is_dir():
+			var absolute_path := managed_dir_path.path_join(entry_name).replace("\\", "/")
+			var normalized_path := _normalized_path(absolute_path)
+			var managed_file := normalized_path.get_file()
+			if managed_file.begins_with("clip_") and managed_file.get_extension().to_lower() == "png":
+				if not referenced.has(normalized_path):
+					DirAccess.remove_absolute(absolute_path)
+		entry_name = dir.get_next()
+	dir.list_dir_end()
 
 
 func _project_root_path() -> String:
@@ -1727,7 +1866,12 @@ func _on_thinking_block_pressed(block_key: String) -> void:
 
 func _build_chat_message_entry(entry: Dictionary, kind: String, entry_index: int = -1) -> Control:
 	var body_text: String = str(entry.get("content", ""))
-	if body_text.is_empty():
+	# Attachment-only user turns have empty `content` but a non-empty
+	# `segments` list (e.g. drop a file + hit send without typing). Keep
+	# the bubble in that case so the chips are still visible.
+	var segments_variant = entry.get("segments", null)
+	var has_segments: bool = segments_variant is Array and (segments_variant as Array).size() > 0
+	if body_text.is_empty() and not has_segments:
 		return Control.new()
 
 	if kind == "user":
@@ -1752,7 +1896,14 @@ func _build_chat_message_entry(entry: Dictionary, kind: String, entry_index: int
 		padding.add_theme_constant_override("margin_right", 8)
 		padding.add_theme_constant_override("margin_bottom", 12)
 		panel.add_child(padding)
-		padding.add_child(_make_stream_text(body_text, kind))
+		# If the sender captured inline chips (`segments`), reproduce Zed's
+		# mention layout: chips flow inline with the text. Older entries
+		# (pre-segments) and plain-text turns fall through to the original
+		# single-TextBlock renderer.
+		if has_segments:
+			padding.add_child(_build_user_bubble_flow(segments_variant as Array))
+		else:
+			padding.add_child(_make_stream_text(body_text, kind))
 		return user_wrapper
 
 	# Zed assistant message spec (thread_view.rs:4797-4802):
@@ -1781,6 +1932,140 @@ func _build_chat_message_entry(entry: Dictionary, kind: String, entry_index: int
 		_attach_assistant_block_right_click(assistant_text, entry_index)
 	assistant_wrapper.add_child(assistant_text)
 	return assistant_wrapper
+
+
+# Builds Zed-style segmented user-message rendering inside a single
+# RichTextLabel. RichTextLabel owns the text layout engine, so CJK
+# characters, whitespace, and Latin words all wrap at their correct
+# natural boundaries without us having to tokenize anything by hand.
+# Chips are inlined via push_meta + push_bgcolor + add_image + add_text
+# so they flow with the text, and clicks surface through meta_clicked.
+#
+# Trade-off vs. Control-based pills: RichTextLabel bgcolor regions are
+# not rounded, so the chip reads as a flat-bg run rather than the
+# pill the composer draws. Text fidelity wins — the user sees exactly
+# the characters they typed in the same order and spacing.
+func _build_user_bubble_flow(segments: Array) -> Control:
+	var rtl := RichTextLabel.new()
+	# `bbcode_enabled = true` is required — without it the internal
+	# layout path for `add_image` + `push_*` didn't drive fit_content
+	# correctly, and each chip reserved a too-tall placeholder so the
+	# bubble rendered with a big blank strip below the content. With
+	# bbcode on, the same programmatic calls route through the tag
+	# parser's sizing machinery and the control measures tight.
+	rtl.bbcode_enabled = true
+	rtl.fit_content = true
+	rtl.scroll_active = false
+	rtl.selection_enabled = true
+	rtl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	rtl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	# push_meta regions default to URL-style underline. Chips are pills,
+	# not hyperlinks — kill the underline so the run reads as a tag.
+	rtl.meta_underlined = false
+
+	var body_color := _editor_color("font_color", "Editor", Color(0.93, 0.94, 0.98, 0.96))
+	rtl.add_theme_color_override("default_color", body_color)
+
+	# Meta click handler needs the segment list so it can resolve the
+	# clicked index back to an open-target dispatch. Binding it per-bubble
+	# avoids a field-level cache that would drift across sessions.
+	rtl.meta_clicked.connect(Callable(self, "_on_user_bubble_meta_clicked").bind(segments))
+
+	var chip_bg := _user_bubble_chip_bg_color()
+
+	for seg_index in range(segments.size()):
+		var segment_variant = segments[seg_index]
+		if typeof(segment_variant) != TYPE_DICTIONARY:
+			continue
+		var segment: Dictionary = segment_variant
+		var segment_type: String = str(segment.get("type", ""))
+		match segment_type:
+			"text":
+				var segment_text: String = _safe_text(str(segment.get("text", "")))
+				if segment_text.is_empty():
+					continue
+				rtl.add_text(segment_text)
+			"chip":
+				# Icon-less chip: just bgcolor + label. Inline
+				# `add_image` oversized the control's fit_content
+				# measurement, making the bubble reserve a tall blank
+				# strip below the text that visually swallowed the next
+				# turn's content. Dropping the icon is an acceptable
+				# trade — the label text alone still identifies the
+				# attachment, and hover tooltips (TODO) can surface the
+				# type glyph when needed.
+				rtl.push_meta("chip:%d" % seg_index)
+				rtl.push_bgcolor(chip_bg)
+				rtl.add_text(" ")
+				rtl.add_text(_safe_text(str(segment.get("label", ""))))
+				rtl.add_text(" ")
+				rtl.pop()  # bgcolor
+				rtl.pop()  # meta
+				# Unstyled trailing space sits outside the bgcolor so the
+				# next text token isn't flush against the chip's right edge.
+				rtl.add_text(" ")
+	return rtl
+
+
+func _chip_segment_to_attachment(segment: Dictionary) -> Dictionary:
+	# Rebuild the attachment dict shape _attachment_icon / _open_path
+	# expect from a transcript chip segment. Kept as its own helper so
+	# the build and click paths can't drift on the field mapping.
+	var payload_variant = segment.get("payload", {})
+	var payload: Dictionary = payload_variant if typeof(payload_variant) == TYPE_DICTIONARY else {}
+	return {
+		"kind": str(segment.get("kind", "")),
+		"label": str(segment.get("label", "")),
+		"path": str(payload.get("path", "")),
+		"scene_path": str(payload.get("scene_path", "")),
+		"relative_node_path": str(payload.get("relative_node_path", "")),
+	}
+
+
+func _user_bubble_chip_bg_color() -> Color:
+	# Subtly lighter than the bubble base so the chip run pops without
+	# competing with the editor accent. Alpha < 1 softens the edge where
+	# the bgcolor meets the surrounding text background.
+	var base := _editor_color("base_color", "Editor", Color(0.16, 0.17, 0.19, 1.0))
+	var chip_color := base.lightened(0.18)
+	chip_color.a = 0.85
+	return chip_color
+
+
+func _on_user_bubble_meta_clicked(meta: Variant, segments: Array) -> void:
+	var meta_str := str(meta)
+	if not meta_str.begins_with("chip:"):
+		return
+	var idx_str := meta_str.substr(5)
+	if not idx_str.is_valid_int():
+		return
+	var idx := int(idx_str)
+	if idx < 0 or idx >= segments.size():
+		return
+	var seg_variant = segments[idx]
+	if typeof(seg_variant) != TYPE_DICTIONARY:
+		return
+	var synthetic := _chip_segment_to_attachment(seg_variant)
+	match str(synthetic.get("kind", "")):
+		"image":
+			# Pasted clipboard images live under a `.gdignore`d directory
+			# so Godot never imports them. `_open_path` → `load()` would
+			# fail with "Failed loading resource". Hand the absolute path
+			# to the OS default viewer instead.
+			var image_path := str(synthetic.get("path", ""))
+			if image_path.begins_with("res://") or image_path.begins_with("user://"):
+				image_path = ProjectSettings.globalize_path(image_path)
+			if not image_path.is_empty():
+				OS.shell_open(image_path)
+		"file":
+			_open_path(str(synthetic.get("path", "")))
+		"scene":
+			_open_path(str(synthetic.get("scene_path", "")))
+		"node":
+			var relative := str(synthetic.get("relative_node_path", ""))
+			if relative.is_empty():
+				relative = "."
+			_focus_attached_node(relative)
 
 
 func _attach_assistant_block_right_click(root: Control, entry_index: int) -> void:
@@ -2501,8 +2786,23 @@ func _send_prompt() -> void:
 	if current_session_index < 0:
 		return
 
-	var prompt: String = prompt_input.text.strip_edges()
-	if prompt.is_empty():
+	var inline_prompt := prompt_input as GodetteComposerPromptInput
+	var prompt: String = ""
+	# Segments capture the composer's inline chip layout so the user
+	# bubble can render the chips interleaved with text (Zed-style).
+	# Captured BEFORE clear_all so the chip metadata is still present.
+	var prompt_segments: Array = []
+	if inline_prompt != null:
+		prompt = inline_prompt.get_plain_text().strip_edges()
+		prompt_segments = inline_prompt.get_segments()
+	else:
+		prompt = prompt_input.text.strip_edges()
+	# Allow attachment-only turns ("here's the file, help me read it") by
+	# treating prompt_text+attachments as the real empty check, not just
+	# the typed prose. The inline chips live in the text buffer but strip
+	# to empty in get_plain_text(), so this matters.
+	var attachments := _session_attachments(current_session_index)
+	if prompt.is_empty() and attachments.is_empty():
 		_append_system_message("Write a prompt first.")
 		return
 
@@ -2510,14 +2810,29 @@ func _send_prompt() -> void:
 	# Busy → enqueue and let `_on_connection_prompt_finished` pick it up
 	# when the current turn ends. `_dispatch_next_prompt` already no-ops
 	# while busy, so calling it unconditionally is safe.
-	var blocks: Array = _build_prompt_blocks(prompt, _session_attachments(current_session_index))
+	var blocks: Array = _build_prompt_blocks(prompt, attachments)
 	var queue: Array = session.get("queued_prompts", [])
 	queue.append({"blocks": blocks})
 	session["queued_prompts"] = queue
+	session["managed_attachment_refs"] = _merge_managed_attachment_refs(
+		session.get("managed_attachment_refs", []),
+		attachments
+	)
 	sessions[current_session_index] = session
 
-	_append_user_message_to_session(current_session_index, prompt)
-	prompt_input.clear()
+	_append_user_message_to_session(current_session_index, prompt, prompt_segments)
+	if inline_prompt != null:
+		# Chips are one-shot, matching Zed's @-mention behaviour: once
+		# the turn is sent the attachment is consumed and the composer
+		# clears. If the user wants the same file / scene / image in
+		# the next turn they re-attach (drag, paste, or @-mention). This
+		# is less fiddly than having to manually backspace-delete a chip
+		# you no longer want, and avoids the "why is this still here?"
+		# surprise after send.
+		inline_prompt.clear_all()
+	else:
+		prompt_input.clear()
+	_set_session_attachments(current_session_index, [])
 	_ensure_remote_session(current_session_index)
 	_dispatch_next_prompt(current_session_index)
 	_refresh_queue_indicator()
@@ -2800,6 +3115,14 @@ func _adapter_candidates(agent_id: String) -> Array:
 		var program_files := OS.get_environment("ProgramFiles").replace("\\", "/")
 		var npx_cmd := program_files.path_join("nodejs").path_join("npx.cmd")
 		if agent_id == "claude_agent":
+			var claude_code_global_cmd := npm_root.path_join("claude-code-acp.cmd")
+			if not cmd_exe.is_empty() and FileAccess.file_exists(claude_code_global_cmd):
+				candidates.append({"path": cmd_exe, "args": PackedStringArray(["/d", "/c", claude_code_global_cmd])})
+			var claude_code_js := zed_root.path_join("claude-code-acp").path_join("dist").path_join("index.js")
+			if FileAccess.file_exists(claude_code_js):
+				candidates.append({"path": "node", "args": PackedStringArray([claude_code_js])})
+			if not cmd_exe.is_empty() and FileAccess.file_exists(npx_cmd):
+				candidates.append({"path": cmd_exe, "args": PackedStringArray(["/d", "/c", npx_cmd, "-y", "@zed-industries/claude-code-acp@0.16.2"])})
 			var claude_global_cmd := npm_root.path_join("claude-agent-acp.cmd")
 			if not cmd_exe.is_empty() and FileAccess.file_exists(claude_global_cmd):
 				candidates.append({"path": cmd_exe, "args": PackedStringArray(["/d", "/c", claude_global_cmd])})
@@ -2820,6 +3143,8 @@ func _adapter_candidates(agent_id: String) -> Array:
 		return candidates
 
 	if agent_id == "claude_agent":
+		candidates.append({"path": "claude-code-acp", "args": PackedStringArray()})
+		candidates.append({"path": "npx", "args": PackedStringArray(["-y", "@zed-industries/claude-code-acp@0.16.2"])})
 		candidates.append({"path": "claude-agent-acp", "args": PackedStringArray()})
 		candidates.append({"path": "npx", "args": PackedStringArray(["-y", "@agentclientprotocol/claude-agent-acp@0.30.0"])})
 	else:
@@ -2975,6 +3300,7 @@ func _evict_session(session_index: int) -> void:
 
 	SessionStoreScript.delete_thread_cache(str(session.get("id", "")))
 	sessions.remove_at(session_index)
+	_schedule_managed_attachment_cleanup()
 
 	if current_session_index == session_index:
 		current_session_index = -1
@@ -3008,6 +3334,18 @@ func _on_connection_session_update(agent_id: String, remote_session_id: String, 
 	if session_index < 0:
 		return
 
+	# During session/load replay, the adapter re-emits the full history as
+	# session/update events. Our on-disk transcript cache is already the
+	# authoritative copy of that history (we persisted it during the
+	# original live turns), so ingesting the replay would double every
+	# entry — and because replay doesn't carry clean turn boundaries,
+	# agent chunks from adjacent turns would merge into one fat entry.
+	# Suppress updates while replay is in flight; live events resume once
+	# _on_connection_session_loaded clears the replay flag.
+	var replay_key: String = "%s|%s" % [agent_id, remote_session_id]
+	if replaying_sessions.has(replay_key):
+		return
+
 	var update_kind := str(update.get("sessionUpdate", ""))
 	match update_kind:
 		"agent_message_chunk":
@@ -3032,7 +3370,6 @@ func _on_connection_session_update(agent_id: String, remote_session_id: String, 
 			_upsert_tool_call_entry(session_index, update)
 		"plan":
 			var plan_entries_in: Array = update.get("entries", [])
-			print("[godette/plan] received plan update from %s session=%s entries=%d" % [agent_id, remote_session_id, plan_entries_in.size()])
 			_upsert_plan_entry(session_index, plan_entries_in)
 		"current_mode_update":
 			_update_session_mode_state(session_index, str(update.get("currentModeId", "")))
@@ -3048,7 +3385,6 @@ func _on_connection_session_update(agent_id: String, remote_session_id: String, 
 			for cmd_variant in update.get("availableCommands", []):
 				if typeof(cmd_variant) == TYPE_DICTIONARY:
 					cmd_names.append(str(cmd_variant.get("name", "?")))
-			print("[godette/cmds] available_commands_update from %s session=%s commands=%s" % [agent_id, remote_session_id, str(cmd_names)])
 		_:
 			pass
 
@@ -3258,6 +3594,7 @@ func attach_paths(paths: PackedStringArray) -> void:
 		return
 
 	var current_attachments := _session_attachments(current_session_index)
+	var newly_added: Array = []
 	for path in paths:
 		var normalized_path := str(path).strip_edges()
 		if normalized_path.is_empty():
@@ -3272,15 +3609,18 @@ func attach_paths(paths: PackedStringArray) -> void:
 		# each attached file and embedded it into the user bubble + the
 		# ACP prompt body; that bloated the per-thread cache and duplicated
 		# content the adapter can fetch on demand.
-		current_attachments.append({
+		var attachment := {
 			"key": key,
 			"kind": "file",
 			"label": normalized_path,
 			"path": normalized_path
-		})
+		}
+		current_attachments.append(attachment)
+		newly_added.append(attachment)
 
 	_set_session_attachments(current_session_index, current_attachments)
-	_refresh_composer_context()
+	for attachment in newly_added:
+		_insert_chip_for_attachment(attachment)
 	_refresh_status()
 
 
@@ -3308,15 +3648,16 @@ func attach_current_scene() -> void:
 		_append_system_message("Current scene is already attached.")
 		return
 
-	current_attachments.append({
+	var scene_attachment := {
 		"key": key,
 		"kind": "scene",
 		"label": label,
 		"scene_path": scene_path,
 		"summary": _build_scene_summary(root)
-	})
+	}
+	current_attachments.append(scene_attachment)
 	_set_session_attachments(current_session_index, current_attachments)
-	_refresh_composer_context()
+	_insert_chip_for_attachment(scene_attachment)
 	_refresh_status()
 
 
@@ -3337,6 +3678,7 @@ func attach_nodes(nodes: Array) -> void:
 
 	var current_attachments := _session_attachments(current_session_index)
 	var root := editor_interface.get_edited_scene_root()
+	var newly_added: Array = []
 	for node in nodes:
 		if not (node is Node):
 			continue
@@ -3350,17 +3692,20 @@ func attach_nodes(nodes: Array) -> void:
 			continue
 
 		var label := "%s (%s)" % [node.name, node.get_class()]
-		current_attachments.append({
+		var node_attachment := {
 			"key": key,
 			"kind": "node",
 			"label": label,
 			"relative_node_path": relative_path,
 			"scene_path": root.scene_file_path if root != null else "",
 			"summary": _describe_node(node)
-		})
+		}
+		current_attachments.append(node_attachment)
+		newly_added.append(node_attachment)
 
 	_set_session_attachments(current_session_index, current_attachments)
-	_refresh_composer_context()
+	for attachment in newly_added:
+		_insert_chip_for_attachment(attachment)
 	_refresh_status()
 
 
@@ -3369,7 +3714,9 @@ func clear_context() -> void:
 		return
 
 	_set_session_attachments(current_session_index, [])
-	_refresh_composer_context()
+	var inline_prompt := prompt_input as GodetteComposerPromptInput
+	if inline_prompt != null:
+		inline_prompt.remove_all_chips()
 	_refresh_status()
 
 
@@ -3391,16 +3738,32 @@ func clear_chat() -> void:
 # behaviour (paste-as-text) still works.
 
 func _on_composer_image_pasted(image: Image) -> void:
-	# Ctrl+V of an image (screenshots, copied rasters) lands here. Save the
-	# image into the per-project attachment dir as PNG so the adapter can
-	# later read it off disk or embed it, then append it as a chip. PNG is
-	# a safe common denominator across adapter ingest paths — lossless,
-	# universally accepted, and we don't have to guess the clipboard's
-	# original MIME type.
+	# Ctrl+V of an image lands here. Normalize pasted rasters into a small,
+	# predictable PNG before attaching them:
+	# 1. cap the long side to 1568 px
+	# 2. convert to RGBA8
+	# 3. save as PNG
+	# 4. reject files over 5 MB
 	if current_session_index < 0 or image == null or image.is_empty():
 		return
 	if not DirAccess.dir_exists_absolute(PASTED_IMAGE_DIR):
 		DirAccess.make_dir_recursive_absolute(PASTED_IMAGE_DIR)
+
+	const ANTHROPIC_SIZE_LIMIT := 1568
+	const MAX_IMAGE_BYTES := 5 * 1024 * 1024
+	var image_w := image.get_width()
+	var image_h := image.get_height()
+	var longest_side := max(image_w, image_h)
+	if longest_side > ANTHROPIC_SIZE_LIMIT:
+		var downscale: float = float(ANTHROPIC_SIZE_LIMIT) / float(longest_side)
+		image.resize(int(image_w * downscale), int(image_h * downscale), Image.INTERPOLATE_BILINEAR)
+
+	# Normalise the pixel format before PNG save. Clipboard images can
+	# arrive in a pile of Godot-internal formats (RGBA8, RGB8, RGBA4444,
+	# RGF etc.) — forcing RGBA8 makes Godot's PngEncoder take the most
+	# exercised code path and produces a stock 8-bit-per-channel PNG.
+	if image.get_format() != Image.FORMAT_RGBA8:
+		image.convert(Image.FORMAT_RGBA8)
 
 	# Ticks-msec suffix: `Time.get_datetime_string_from_system` only has
 	# second resolution, so rapid paste bursts would collide on the
@@ -3413,21 +3776,27 @@ func _on_composer_image_pasted(image: Image) -> void:
 	if save_err != OK:
 		_append_system_message("Couldn't save pasted image: error %d" % save_err)
 		return
+	var saved_bytes := FileAccess.get_file_as_bytes(path).size()
+	if saved_bytes > MAX_IMAGE_BYTES:
+		DirAccess.remove_absolute(path)
+		_append_system_message("Pasted image is too large (%d bytes) — try a smaller screenshot." % saved_bytes)
+		return
 
 	var key := "image:%s" % path
 	var session_attachments := _session_attachments(current_session_index)
 	if _attachments_has_key(session_attachments, key):
 		return
-	session_attachments.append({
+	var image_attachment := {
 		"key": key,
 		"kind": "image",
 		"label": filename,
 		"path": path,
 		"width": image.get_width(),
 		"height": image.get_height()
-	})
+	}
+	session_attachments.append(image_attachment)
 	_set_session_attachments(current_session_index, session_attachments)
-	_refresh_composer_context()
+	_insert_chip_for_attachment(image_attachment)
 	_refresh_status()
 	_schedule_persist_state()
 
@@ -3439,9 +3808,27 @@ func _composer_can_drop(_at_position: Vector2, data: Variant) -> bool:
 	return kind == "files" or kind == "nodes"
 
 
-func _composer_drop(_at_position: Vector2, data: Variant) -> void:
+func _composer_drop(at_position: Vector2, data: Variant) -> void:
 	if typeof(data) != TYPE_DICTIONARY:
 		return
+	# Position the caret at the drop point before we insert chips so the
+	# chip lands exactly where the user aimed — inline chips follow the
+	# caret, so this is the only place that cares about `at_position`.
+	# get_line_column_at_pos is tolerant of positions slightly outside the
+	# text area (snaps to the nearest column), so no bounds check needed.
+	#
+	# `deselect()` afterwards is load-bearing: TextEdit marks a single-
+	# character selection at the drag target while a drag is hovering, as
+	# a drop indicator. If we leave that selection in place, the next
+	# insert_text_at_caret call (inside insert_chip) REPLACES it — eating
+	# the character the user dropped right next to.
+	var inline_prompt := prompt_input as GodetteComposerPromptInput
+	if inline_prompt != null:
+		var drop_coord: Vector2i = inline_prompt.get_line_column_at_pos(Vector2i(at_position))
+		inline_prompt.set_caret_line(drop_coord.y)
+		inline_prompt.set_caret_column(drop_coord.x)
+		inline_prompt.deselect()
+
 	var kind := str(data.get("type", ""))
 	match kind:
 		"files":
@@ -3500,37 +3887,139 @@ func _build_prompt_blocks(prompt: String, current_attachments: Array) -> Array:
 
 
 func _refresh_composer_context() -> void:
-	if composer_context == null:
+	if composer_chip_overlay == null or prompt_input == null:
 		return
 
-	# Keep chip styling in step with the editor's base color in case the user
+	# Keep overlay styling in step with the editor theme in case the user
 	# flips between dark / light themes at runtime.
-	composer_context.set_chip_base_color(
+	composer_chip_overlay.set_chip_base_color(
 		_editor_color("base_color", "Editor", Color(0.22, 0.24, 0.28, 1.0)).lightened(0.08)
 	)
+	composer_chip_overlay.set_font_color(
+		_editor_color("font_color", "Editor", Color(0.97, 0.97, 0.995, 0.98))
+	)
 
-	if current_session_index < 0:
-		composer_context.set_attachments([])
-		composer_context.visible = false
+	# The inline composer owns its own chip metadata — attach_paths /
+	# attach_nodes / image_pasted already push insert_chip when the user
+	# adds something, and backspace drives removal via chips_changed. The
+	# only sync job left is converging the overlay's chip set with the
+	# session's attachment list in edge cases (session switch, programmatic
+	# clear) where the two can drift.
+	var inline_prompt := prompt_input as GodetteComposerPromptInput
+	if inline_prompt == null:
 		return
 
-	var raw_attachments: Array = _session_attachments(current_session_index)
-	# Enrich with runtime-only fields (editor-theme icons) before handing to
-	# the composer. The originals in `sessions[i].attachments` stay clean so
-	# persistence doesn't have to worry about non-serializable Texture2D
-	# references leaking into the per-thread cache.
-	var enriched: Array = []
-	for attachment_variant in raw_attachments:
+	if current_session_index < 0:
+		inline_prompt.clear_all()
+		return
+
+	var attachments: Array = _session_attachments(current_session_index)
+	var desired_keys: Array = []
+	var attachment_by_key: Dictionary = {}
+	for attachment_variant in attachments:
 		if typeof(attachment_variant) != TYPE_DICTIONARY:
 			continue
-		var copy: Dictionary = (attachment_variant as Dictionary).duplicate()
-		var icon := _attachment_icon(copy)
-		if icon != null:
-			copy["_icon_texture"] = icon
-		enriched.append(copy)
+		var attachment: Dictionary = attachment_variant
+		var key := str(attachment.get("key", ""))
+		if key.is_empty():
+			continue
+		desired_keys.append(key)
+		attachment_by_key[key] = attachment
 
-	composer_context.set_attachments(enriched)
-	composer_context.visible = composer_context.has_attachments()
+	var existing_keys := inline_prompt.get_chip_keys_in_order()
+	var existing_set: Dictionary = {}
+	for existing in existing_keys:
+		existing_set[existing] = true
+	var desired_set: Dictionary = {}
+	for desired in desired_keys:
+		desired_set[desired] = true
+
+	# Drop chips the attachment list no longer carries (usually from a
+	# programmatic clear; user-driven backspace already synced the other
+	# direction via chips_changed).
+	for existing_key in existing_keys:
+		if not desired_set.has(existing_key):
+			inline_prompt.remove_chip_by_key(existing_key)
+
+	# Add chips that the attachment list has but the composer doesn't
+	# (session switch restore, first-time attach from a code path that
+	# didn't go through attach_*). New chips land at the caret, so push
+	# the caret to end-of-buffer first.
+	for desired_key in desired_keys:
+		if existing_set.has(desired_key):
+			continue
+		var attachment: Dictionary = attachment_by_key[desired_key]
+		_insert_chip_for_attachment(attachment)
+
+
+# Resolves an attachment dict to the display bits the prompt input needs
+# (label, icon, tooltip) and inserts a chip at the current caret position.
+# Centralised so attach_paths / attach_nodes / image_pasted / context
+# refresh all compute the same label + icon for a given attachment.
+#
+# Caret is deliberately NOT moved before insertion: Zed-style "attach at
+# cursor" is the natural behaviour once chips are inline. Callers that
+# want append-to-end semantics (session restore, context-refresh sync)
+# position the caret themselves first; drag-drop positions it to the drop
+# point. The common path — user pasting an image or dragging a file —
+# ends up with a chip exactly where the text caret was, not teleported to
+# the end of the prompt.
+func _insert_chip_for_attachment(attachment: Dictionary) -> void:
+	if prompt_input == null:
+		return
+	var inline_prompt := prompt_input as GodetteComposerPromptInput
+	if inline_prompt == null:
+		return
+	var key := str(attachment.get("key", ""))
+	if key.is_empty():
+		return
+	var label := ComposerContextScript.display_label_for_attachment(attachment)
+	var tooltip := ComposerContextScript.tooltip_for_attachment(attachment)
+	var icon := _attachment_icon(attachment)
+	inline_prompt.insert_chip(
+		key,
+		str(attachment.get("kind", "")),
+		label,
+		icon,
+		tooltip,
+		_chip_payload_for_attachment(attachment)
+	)
+
+
+# Minimal slice of the attachment dict that the hover tooltip needs. Kept
+# narrow so the prompt input doesn't end up holding onto unrelated session
+# fields (summary bytes for attached scenes can get large).
+func _chip_payload_for_attachment(attachment: Dictionary) -> Dictionary:
+	return {
+		"path": str(attachment.get("path", "")),
+		"scene_path": str(attachment.get("scene_path", "")),
+		"relative_node_path": str(attachment.get("relative_node_path", "")),
+		"width": int(attachment.get("width", 0)),
+		"height": int(attachment.get("height", 0)),
+	}
+
+
+# Builds a per-attachment display-bits lookup for restore_draft. The draft
+# only stores codepoint→key bindings + the raw text buffer; the display
+# metadata (icon, label, tooltip) is derived fresh from session attachments
+# so a renamed / moved target picks up its new name on restore.
+func _build_chip_metadata_lookup(session_index: int) -> Dictionary:
+	var out: Dictionary = {}
+	for attachment_variant in _session_attachments(session_index):
+		if typeof(attachment_variant) != TYPE_DICTIONARY:
+			continue
+		var attachment: Dictionary = attachment_variant
+		var key := str(attachment.get("key", ""))
+		if key.is_empty():
+			continue
+		out[key] = {
+			"kind": str(attachment.get("kind", "")),
+			"label": ComposerContextScript.display_label_for_attachment(attachment),
+			"tooltip": ComposerContextScript.tooltip_for_attachment(attachment),
+			"icon": _attachment_icon(attachment),
+			"payload": _chip_payload_for_attachment(attachment),
+		}
+	return out
 
 
 func _attachment_icon(attachment: Dictionary) -> Texture2D:
@@ -4528,6 +5017,7 @@ func _import_remote_sessions(agent_id: String, remote_sessions: Array) -> void:
 			"loading_remote_session": false,
 			"creating_remote_session": false,
 			"attachments": [],
+			"managed_attachment_refs": [],
 			"transcript": [],
 			"assistant_entry_index": -1,
 			"plan_entry_index": -1,
@@ -4576,6 +5066,7 @@ func _create_session(agent_id: String, switch_to_new: bool, connect_remote: bool
 		"loading_remote_session": false,
 		"creating_remote_session": false,
 		"attachments": [],
+		"managed_attachment_refs": [],
 		"transcript": [],
 		"assistant_entry_index": -1,
 		"plan_entry_index": -1,
@@ -4622,12 +5113,32 @@ func _switch_session(index: int) -> void:
 	# outgoing one first (flushes its cache + clears heavy fields), then
 	# hydrate the new one from disk if it isn't already in memory.
 	var previous_session_index := current_session_index
+	var inline_prompt := prompt_input as GodetteComposerPromptInput
+	# Capture the outgoing session's composer state (typed text + chip
+	# bindings) so switching back restores exactly what the user was
+	# looking at. Chip metadata itself is re-derived from the session's
+	# attachments on restore — the draft only needs to remember WHICH
+	# chips were placed where.
+	if inline_prompt != null and previous_session_index != index \
+			and previous_session_index >= 0 and previous_session_index < sessions.size():
+		sessions[previous_session_index]["composer_draft"] = inline_prompt.serialize_draft()
 	if previous_session_index != index and previous_session_index >= 0 and previous_session_index < sessions.size():
 		SessionStoreScript.dehydrate(sessions[previous_session_index])
 	SessionStoreScript.hydrate(sessions[index])
 
 	current_session_index = index
 	selected_agent_id = str(sessions[index].get("agent_id", DEFAULT_AGENT_ID))
+
+	# Restore the incoming session's draft (if any) before the refresh
+	# passes run — _refresh_composer_context will then diff chip state
+	# against session.attachments and no-op if the restore already matches.
+	if inline_prompt != null:
+		var draft_variant = sessions[index].get("composer_draft", {})
+		if typeof(draft_variant) == TYPE_DICTIONARY and not (draft_variant as Dictionary).is_empty():
+			inline_prompt.restore_draft(draft_variant, _build_chip_metadata_lookup(index))
+		else:
+			inline_prompt.clear_all()
+
 	_refresh_thread_menu()
 	_refresh_add_menu()
 	_refresh_composer_context()
@@ -4639,8 +5150,8 @@ func _switch_session(index: int) -> void:
 	_schedule_persist_state()
 
 
-func _append_user_message_to_session(session_index: int, text: String) -> void:
-	_append_transcript_to_session(session_index, "You", text)
+func _append_user_message_to_session(session_index: int, text: String, segments: Array = []) -> void:
+	_append_transcript_to_session(session_index, "You", text, segments)
 
 
 func _append_system_message(text: String) -> void:
@@ -4654,17 +5165,24 @@ func _append_system_message_to_agent(agent_id: String, text: String) -> void:
 		_append_transcript_to_session(target_index, "System", text)
 
 
-func _append_transcript_to_session(session_index: int, speaker: String, text: String) -> void:
+func _append_transcript_to_session(session_index: int, speaker: String, text: String, segments: Array = []) -> void:
 	if session_index < 0 or session_index >= sessions.size():
 		return
 
 	var session: Dictionary = sessions[session_index]
 	var current_transcript: Array = session.get("transcript", [])
-	current_transcript.append({
+	var entry: Dictionary = {
 		"kind": _entry_kind({"speaker": speaker}),
 		"speaker": speaker,
 		"content": text
-	})
+	}
+	# Only user messages carry segments today; the renderer falls back to
+	# `content` whenever `segments` is absent, which keeps assistant /
+	# system / tool entries unchanged and makes older transcripts (saved
+	# before this field existed) render as plain text.
+	if not segments.is_empty():
+		entry["segments"] = segments
+	current_transcript.append(entry)
 	var new_index: int = current_transcript.size() - 1
 	# Any non-assistant / non-thought entry breaks the streaming continuity.
 	# Without this reset, a session/load replay (which does not emit a
@@ -5089,6 +5607,10 @@ func _set_session_attachments(session_index: int, attachments: Array) -> void:
 	session["attachments"] = attachments
 	sessions[session_index] = session
 	_touch_session(session_index)
+	# Cleanup only fires on dock startup and session deletion. Per-change
+	# scanning every time attachments mutate (add, remove, send-consume)
+	# is wasted disk I/O: orphans can wait until the next startup, and
+	# attachments in active sessions must be kept alive anyway.
 
 
 func _session_transcript(session_index: int) -> Array:
@@ -5118,6 +5640,15 @@ func _on_attachment_activated(key: String) -> void:
 		var kind := str(attachment.get("kind", ""))
 		if kind == "file":
 			_open_path(str(attachment.get("path", "")))
+		elif kind == "image":
+			# Pasted images live in a `.gdignore`d scratch dir so the
+			# Godot resource loader can't open them; shell out to the OS
+			# default viewer instead.
+			var img_path := str(attachment.get("path", ""))
+			if img_path.begins_with("res://") or img_path.begins_with("user://"):
+				img_path = ProjectSettings.globalize_path(img_path)
+			if not img_path.is_empty():
+				OS.shell_open(img_path)
 		elif kind == "scene":
 			_open_path(str(attachment.get("scene_path", "")))
 		elif kind == "node":
@@ -5125,26 +5656,45 @@ func _on_attachment_activated(key: String) -> void:
 		return
 
 
-func _on_attachment_remove_requested(key: String) -> void:
-	if current_session_index < 0 or key.is_empty():
+# Fired by prompt_input whenever the text buffer's chip set or order
+# changes from a user edit (backspace at run end, delete-forward at run
+# start, selection-spanning delete). The authoritative chip set now lives
+# in the text buffer, so we sync session["attachments"] to match — drop
+# missing keys, reorder survivors to chip order for prompt-block
+# consistency.
+func _on_composer_chips_changed(ordered_keys: Array) -> void:
+	if current_session_index < 0:
+		return
+	var attachments := _session_attachments(current_session_index)
+	if attachments.is_empty() and ordered_keys.is_empty():
 		return
 
-	var current_attachments := _session_attachments(current_session_index)
-	var filtered: Array = []
-	var removed := false
-	for attachment_variant in current_attachments:
+	var by_key: Dictionary = {}
+	for attachment_variant in attachments:
 		if typeof(attachment_variant) != TYPE_DICTIONARY:
-			filtered.append(attachment_variant)
 			continue
 		var attachment: Dictionary = attachment_variant
-		if str(attachment.get("key", "")) == key:
-			removed = true
-			continue
-		filtered.append(attachment)
-	if not removed:
-		return
-	_set_session_attachments(current_session_index, filtered)
-	_refresh_composer_context()
+		by_key[str(attachment.get("key", ""))] = attachment
+
+	var reordered: Array = []
+	for key_variant in ordered_keys:
+		var key := str(key_variant)
+		if by_key.has(key):
+			reordered.append(by_key[key])
+
+	# Short-circuit when nothing actually changed to avoid firing persist
+	# timers on caret-only edits. Length + key order comparison is enough
+	# since content dicts are shared by reference.
+	if reordered.size() == attachments.size():
+		var identical := true
+		for i in reordered.size():
+			if str(reordered[i].get("key", "")) != str(attachments[i].get("key", "")):
+				identical = false
+				break
+		if identical:
+			return
+
+	_set_session_attachments(current_session_index, reordered)
 	_refresh_status()
 	_schedule_persist_state()
 

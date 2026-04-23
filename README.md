@@ -2,7 +2,7 @@
 
 # Agent Godette
 
-_v0.1.0 — Godot 4.6_
+_v0.2.0 — Godot 4.6_
 <img width="3840" height="2076" alt="image" src="https://github.com/user-attachments/assets/807fc791-77de-40ad-a085-b906d7ef7154" />
 
 A Godot 4 editor plugin that talks to local ACP (Agent Client Protocol) adapters — the same transport Zed uses for external agents. Godot is the client; Claude and Codex run as local stdio subprocesses; no HTTP bridge.
@@ -21,10 +21,12 @@ A Godot 4 editor plugin that talks to local ACP (Agent Client Protocol) adapters
 - Zed-styled tool call rendering: read/search/fetch/think tools show as one-line inline rows; edit/bash/permission tools get a full card.
 - **Queued messages**: type and hit `Enter` while the agent is still replying — the prompt stacks up and auto-dispatches when the current turn ends. `Shift+Enter` inserts a newline.
 - Permission prompts surface as in-dock dialogs with approve / reject buttons.
+- **Inline chip composer** (Zed-style): attachments become inline pills in the prompt `TextEdit`, interleaved with typed text. Backspace / delete / arrow keys treat each chip as a single atomic glyph. The sent user bubble renders the same inline layout via `RichTextLabel` so the transcript reads exactly like the composer looked.
 - Attachments you can drop into a prompt:
   - the currently edited scene,
   - the selected Scene Tree nodes,
-  - selected FileSystem files (including pasted screenshots).
+  - selected FileSystem files,
+  - pasted screenshots (saved as PNG under `addons/godette_agent/attachments/`, `.gdignore`d out of the editor's resource system).
 - Right-click entry points:
   - FileSystem dock → `Ask Agent About Selection`
   - Scene Tree dock → `Ask Agent About Nodes`
@@ -44,11 +46,16 @@ addons/godette_agent/
 ├── virtual_feed.gd                 viewport-virtualised scroll feed (only
 │                                   renders entries intersecting the visible
 │                                   range; O(log n) y lookup)
-├── composer_prompt_input.gd        prompt input (image paste, Enter to submit)
-├── composer_context.gd             attachments strip above the composer
+├── composer_prompt_input.gd        chip-aware TextEdit (inline attachment
+│                                   pills, image paste, Enter to submit)
+├── composer_chip_overlay.gd        draws chip panels on top of the prompt
+│                                   input's reserved anchor+NBSP runs
+├── composer_context.gd             pure transforms: chip label/tooltip,
+│                                   attachments→ACP prompt-block builder
 ├── loading_scanner.gd              top bar progress indicator
 ├── filesystem_context_menu.gd      FileSystem right-click integration
-└── scene_tree_context_menu.gd      Scene Tree right-click integration
+├── scene_tree_context_menu.gd     Scene Tree right-click integration
+└── attachments/                   pasted clipboard PNGs (gdignored)
 ```
 
 ## Requirements
@@ -82,6 +89,9 @@ The index file (`godette_sessions.json`) holds per-session metadata; each thread
 
 - Transport is ACP over stdio, matching Zed's external-agent design. No HTTP, no separate bridge process.
 - Streamed output and session isolation are fully working. Multi-session parallel turns, queued prompts, and mid-stream cancellation all handled.
+- **Transcript cache is the source of truth** (mirrors Zed's SQLite-backed approach): the on-disk per-thread JSON files are authoritative, and `session/load` replay events from reconnecting adapters are suppressed so they don't double-append on top of cached history.
+- **Image attachments are attached as file references, not inline vision.** claude-code-acp routes all file reads through `fs/read_text_file` which is UTF-8-only, so binary bytes (PNG etc.) can't round-trip as inline base64 ImageContent reliably. Pasted screenshots are saved to disk and sent as `resource_link` — the agent surfaces a clear "can't read binary" message when it tries to read them. Describe the image in prose if the model needs to "see" it.
+- `fs/read_text_file` uses the static `FileAccess.get_file_as_bytes` path to avoid a Godot quirk where holding an instance `FileAccess.open` handle on a file the editor also has open poisons the stdio pipe's internal state.
 - File edit review is still minimal — permission requests are shown but the diff UX is much simpler than Zed's side-by-side review. That's on the roadmap.
 
 ## License

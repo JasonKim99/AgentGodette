@@ -78,7 +78,15 @@ func start(p_agent_id: String, launch_candidates: Array) -> bool:
 		emit_signal("transport_status", agent_id, "starting")
 		_send_request("initialize", {
 			"protocolVersion": PROTOCOL_VERSION,
-			"clientCapabilities": {}
+			# Advertise the file capabilities that the adapters already know
+			# how to call back into (`fs/read_text_file`, `fs/write_text_file`).
+			"clientCapabilities": {
+				"fs": {
+					"readTextFile": true,
+					"writeTextFile": true,
+				},
+				"terminal": false,
+			}
 		})
 		return true
 
@@ -226,17 +234,25 @@ func shutdown() -> void:
 func _process(_delta: float) -> void:
 	_pump_stdout()
 	_pump_stderr()
+	_check_process_liveness()
+
+
+func _check_process_liveness() -> void:
+	if pid < 0:
+		return
+	if not OS.is_process_running(pid):
+		pid = -1
+		emit_signal("transport_status", agent_id, "offline")
+		emit_signal("protocol_error", agent_id, "ACP adapter for %s exited unexpectedly." % agent_id)
 
 
 func _pump_stdout() -> void:
 	if stdio_pipe == null:
 		return
 
-	while true:
-		var chunk: PackedByteArray = stdio_pipe.get_buffer(READ_CHUNK_BYTES)
-		if chunk.is_empty():
-			break
-		stdout_bytes.append_array(chunk)
+	var stdout_chunk := _read_available_pipe_bytes(stdio_pipe)
+	if not stdout_chunk.is_empty():
+		stdout_bytes.append_array(stdout_chunk)
 
 	var processed: int = 0
 	while processed < MAX_MESSAGES_PER_FRAME:
@@ -255,11 +271,9 @@ func _pump_stderr() -> void:
 	if stderr_pipe == null:
 		return
 
-	while true:
-		var chunk: PackedByteArray = stderr_pipe.get_buffer(READ_CHUNK_BYTES)
-		if chunk.is_empty():
-			break
-		stderr_bytes.append_array(chunk)
+	var stderr_chunk := _read_available_pipe_bytes(stderr_pipe)
+	if not stderr_chunk.is_empty():
+		stderr_bytes.append_array(stderr_chunk)
 
 	while true:
 		var nl_index: int = stderr_bytes.find(0x0A)
@@ -387,11 +401,144 @@ func _handle_request(message: Dictionary) -> void:
 	var method: String = str(message.get("method", ""))
 	var params: Dictionary = message.get("params", {})
 
-	if method == "session/request_permission":
-		emit_signal("permission_requested", agent_id, request_id, params)
-		return
+	match method:
+		"session/request_permission":
+			emit_signal("permission_requested", agent_id, request_id, params)
+			return
+		"fs/read_text_file":
+			_handle_fs_read_text_file(request_id, params)
+			return
+		"fs/write_text_file":
+			_handle_fs_write_text_file(request_id, params)
+			return
 
 	_send_error(request_id, -32601, "Method not found: %s" % method)
+
+
+func _handle_fs_read_text_file(request_id: int, params: Dictionary) -> void:
+	var raw_path := str(params.get("path", ""))
+	var path := _normalize_fs_path(raw_path)
+	if path.is_empty():
+		_send_error(request_id, -32602, "fs/read_text_file: missing path")
+		return
+	# Use the static `get_file_as_bytes` / `get_string_from_utf8` pair
+	# instead of holding a FileAccess instance open. When the user has the
+	# target file open in the Godot editor, keeping our own FileAccess
+	# handle on the same path appears to poison FileAccess's internal
+	# state such that the very next write to our stdio pipe handle enters
+	# an ERR_FILE_CANT_READ state and the adapter never receives our
+	# response. The static byte-read path sidesteps whatever the editor's
+	# resource system is doing to files it's observing.
+	var bytes: PackedByteArray = FileAccess.get_file_as_bytes(path)
+	var read_err := FileAccess.get_open_error()
+	if read_err != OK:
+		_send_error(request_id, -32603, "fs/read_text_file: cannot open %s (err %d)" % [path, read_err])
+		return
+	# fs/read_text_file is a TEXT endpoint per ACP spec. If the bytes
+	# don't decode cleanly as UTF-8 (e.g. a PNG sneaks in as `file_path`
+	# because the adapter routes all Read calls through this one method),
+	# bail with an error instead of shipping U+FFFD-riddled gibberish to
+	# the agent — which turns into "Invalid UTF-8 leading byte" warnings
+	# on its parser side and silently corrupts the conversation.
+	if not _is_valid_utf8(bytes):
+		_send_error(request_id, -32603, "fs/read_text_file: %s is not a UTF-8 text file" % path)
+		return
+	var content := bytes.get_string_from_utf8()
+
+	# Optional `line` (1-based) + `limit` crop, per ACP schema. The agent
+	# uses this to avoid pulling the whole file when it already knows it
+	# only wants a hunk.
+	var line_start_variant = params.get("line", null)
+	var limit_variant = params.get("limit", null)
+	if line_start_variant != null or limit_variant != null:
+		var lines := content.split("\n")
+		var start: int = max(0, int(line_start_variant) - 1) if line_start_variant != null else 0
+		var end_exclusive: int = lines.size()
+		if limit_variant != null:
+			end_exclusive = min(lines.size(), start + int(limit_variant))
+		content = "\n".join(lines.slice(start, end_exclusive))
+
+	_send_message({
+		"jsonrpc": JSONRPC_VERSION,
+		"id": request_id,
+		"result": {"content": content}
+	})
+
+
+func _handle_fs_write_text_file(request_id: int, params: Dictionary) -> void:
+	var path := _normalize_fs_path(str(params.get("path", "")))
+	if path.is_empty():
+		_send_error(request_id, -32602, "fs/write_text_file: missing path")
+		return
+	var content := str(params.get("content", ""))
+
+	# Create parent dir so the agent doesn't have to MkdirP in advance.
+	var parent_dir := path.get_base_dir()
+	if not parent_dir.is_empty() and not DirAccess.dir_exists_absolute(parent_dir):
+		DirAccess.make_dir_recursive_absolute(parent_dir)
+
+	var file := FileAccess.open(path, FileAccess.WRITE)
+	if file == null:
+		_send_error(request_id, -32603, "fs/write_text_file: cannot open %s (err %d)" % [path, FileAccess.get_open_error()])
+		return
+	file.store_string(content)
+	file.close()
+
+	_send_message({
+		"jsonrpc": JSONRPC_VERSION,
+		"id": request_id,
+		"result": {}
+	})
+
+
+# Quick UTF-8 well-formedness check. Avoids shipping PNG / binary bytes
+# back through fs/read_text_file as mangled replacement-char strings.
+# Uses the same state machine as RFC 3629: leading-byte classifier
+# followed by a fixed number of 10xxxxxx continuation bytes.
+static func _is_valid_utf8(bytes: PackedByteArray) -> bool:
+	var i := 0
+	var length := bytes.size()
+	while i < length:
+		var b: int = bytes[i]
+		var needed := 0
+		if b < 0x80:
+			needed = 0
+		elif (b & 0xE0) == 0xC0 and b >= 0xC2:
+			needed = 1
+		elif (b & 0xF0) == 0xE0:
+			needed = 2
+		elif (b & 0xF8) == 0xF0 and b <= 0xF4:
+			needed = 3
+		else:
+			return false
+		if i + needed >= length:
+			return false
+		for j in range(1, needed + 1):
+			if (bytes[i + j] & 0xC0) != 0x80:
+				return false
+		i += needed + 1
+	return true
+
+
+# Accept both raw OS paths and `file://` URIs for fs/* handlers. Some
+# agents take the URI from a resource_link and pass it through verbatim,
+# which FileAccess.open can't resolve on Windows (the leading `/` after
+# `file://` confuses it). Strip the scheme + URL-decode percent escapes
+# before handing off.
+func _normalize_fs_path(raw: String) -> String:
+	var p := raw.strip_edges()
+	if p.is_empty():
+		return p
+	if p.begins_with("file://"):
+		p = p.substr(7)
+		# `file:///C:/foo` -> `C:/foo` on Windows; `file:///abs/path`
+		# -> `/abs/path` on POSIX. Only strip the leading slash when
+		# the next character is a Windows drive letter, so POSIX roots
+		# survive.
+		if p.length() >= 3 and p.begins_with("/") and p.substr(2, 1) == ":":
+			p = p.substr(1)
+		p = p.uri_decode()
+	return p
 
 
 func _handle_notification(message: Dictionary) -> void:
@@ -518,5 +665,56 @@ func _send_message(payload: Dictionary) -> void:
 	if stdio_pipe == null:
 		return
 
-	stdio_pipe.store_string(JSON.stringify(payload) + "\n")
-	stdio_pipe.flush()
+	var encoded := JSON.stringify(payload)
+	# The ACP SDK consumes newline-delimited UTF-8 JSON. Sending text via
+	# `store_string()` in multiple chunks proved unsafe on Windows pipes:
+	# the adapter started parsing at the 4096-char chunk boundary, which
+	# means Godot's text-path write was effectively breaking the NDJSON
+	# framing. Send raw UTF-8 bytes instead and keep chunking at the byte
+	# layer so large prompts still avoid pipe-buffer stalls.
+	var bytes := (encoded + "\n").to_utf8_buffer()
+	_write_chunked_bytes(bytes)
+
+
+func _read_available_pipe_bytes(pipe: FileAccess) -> PackedByteArray:
+	var out := PackedByteArray()
+	if pipe == null:
+		return out
+
+	# For a pipe, `get_length()` reports the currently available bytes.
+	# Read exactly that much instead of blindly asking for a fixed-size
+	# chunk; this avoids the Windows/Godot edge case where small prompt
+	# updates never surface when the requested read size is larger than the
+	# buffered amount.
+	var available := pipe.get_length()
+	while available > 0:
+		var chunk_size: int = min(available, READ_CHUNK_BYTES)
+		var chunk := pipe.get_buffer(chunk_size)
+		if chunk.is_empty():
+			break
+		out.append_array(chunk)
+		available = pipe.get_length()
+	return out
+
+
+func _write_chunked_bytes(payload: PackedByteArray) -> void:
+	if stdio_pipe == null:
+		return
+	# 64 KiB chunks — large enough that any normal JSON-RPC response
+	# (fs/read_text_file, session/prompt, etc.) fits in one store_buffer
+	# call. Earlier 4 KiB chunking caused fs responses to be split at the
+	# exact Windows pipe buffer boundary: Godot's first flush pushed 4 KiB
+	# to the OS pipe, the adapter read that chunk, found no `\n`, and
+	# waited — but Godot's second `store_buffer` + `flush` for the
+	# remaining bytes never reached the adapter (pipe_err=13 surfaced on
+	# our side). Keeping the chunk loop for truly-huge writes (e.g. a
+	# big file pasted as content) so the OS pipe can drain between chunks
+	# without us forcing a single monster write.
+	const CHUNK := 65536
+	var total := payload.size()
+	var offset := 0
+	while offset < total:
+		var end_offset: int = min(total, offset + CHUNK)
+		stdio_pipe.store_buffer(payload.slice(offset, end_offset))
+		stdio_pipe.flush()
+		offset = end_offset
