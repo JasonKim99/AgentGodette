@@ -1,10 +1,10 @@
 <img width="1672" height="941" alt="ChatGPT Image 2026年4月22日 06_27_35" src="https://github.com/user-attachments/assets/501fa074-759c-41fa-966c-e3ea2377f468" />
 
-_Cover art inspired by Agent 47._
+Cover art inspired by Agent 47.
 
 # Agent Godette
 
-_v0.3.1
+v0.3.1
 <img width="3840" height="2076" alt="image" src="https://github.com/user-attachments/assets/807fc791-77de-40ad-a085-b906d7ef7154" />
 
 ## What it is
