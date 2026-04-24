@@ -5,7 +5,13 @@ Cover art inspired by Agent 47.
 # Agent Godette
 
 v0.3.1
-<img width="3840" height="2076" alt="image" src="https://github.com/user-attachments/assets/807fc791-77de-40ad-a085-b906d7ef7154" />
+
+Select Models
+<img width="3840" height="2076" alt="Snipaste_2026-04-24_22-18-27" src="https://github.com/user-attachments/assets/832df8ad-b280-4d42-8f54-8d170a200d58" />
+
+Plan + Queue + Select Scene Node Directly
+<img width="3840" height="2076" alt="Snipaste_2026-04-24_22-19-50" src="https://github.com/user-attachments/assets/1e804118-7a33-496e-bdf9-7094b0407733" />
+
 
 ## What it is
 
