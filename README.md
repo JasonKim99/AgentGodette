@@ -6,10 +6,12 @@ Cover art inspired by Agent 47.
 
 v0.3.1
 
-Select Models
+**Per-session model, mode, and reasoning** — switch model, reasoning effort, and permission mode per thread, right from the composer bar.
+
 <img width="3840" height="2076" alt="Snipaste_2026-04-24_22-18-27" src="https://github.com/user-attachments/assets/832df8ad-b280-4d42-8f54-8d170a200d58" />
 
-Plan + Queue + Select Scene Node Directly
+**Plan · Queue · SceneTree focus** — the agent's TodoWrite plan collapses above the composer, queued follow-up prompts stack underneath it, and any node you've selected in the SceneTree auto-attaches as implicit context on send.
+
 <img width="3840" height="2076" alt="Snipaste_2026-04-24_22-19-50" src="https://github.com/user-attachments/assets/1e804118-7a33-496e-bdf9-7094b0407733" />
 
 
