@@ -1,107 +1,20 @@
 <img width="1672" height="941" alt="ChatGPT Image 2026年4月22日 06_27_35" src="https://github.com/user-attachments/assets/501fa074-759c-41fa-966c-e3ea2377f468" />
 
+_Cover art inspired by Agent 47._
+
 # Agent Godette
 
-_v0.3.0 — Godot 4.6_
+_v0.3.1
 <img width="3840" height="2076" alt="image" src="https://github.com/user-attachments/assets/807fc791-77de-40ad-a085-b906d7ef7154" />
 
-A Godot 4 editor plugin that talks to local ACP (Agent Client Protocol) adapters — the same transport Zed uses for external agents. Godot is the client; Claude and Codex run as local stdio subprocesses; no HTTP bridge.
+## What it is
 
-## What it does
+A Godot 4 editor plugin that talks to local ACP (Agent Client Protocol) adapters — Claude and Codex run as stdio subprocesses, the editor is the client. No HTTP bridge.
 
-- Adds an **Agent** dock inside the Godot editor.
-- Supports two local agents out of the box:
-  - `Claude Agent`
-  - `Codex CLI`
-- Runs multiple chat sessions side by side, each with its own transcript, attachments, and queued prompts.
-- Spawns the selected ACP adapter on demand and streams its `session/update` events straight into the dock.
-- Renders agent replies as markdown: headings, lists, tables (GFM), fenced code blocks, blockquotes, inline code / bold / italic / links, horizontal rules.
-- Cross-block text selection: drag across paragraphs / list items / table cells within one reply; `Ctrl+C` copies the whole selection, `Esc` clears.
-- **Plan drawer** attached above the composer (Zed-style): renders the agent's `TodoWrite` output with Zed's three SVG icons (pending dashed ring / in-progress spinning ring + center dot / completed check), `N/M` progress or "All Done" badge, collapse toggle, × to clear. Expanded by default; user's collapsed state sticks.
-- **Queue drawer** with full per-message controls matching Zed: the first row shows Trash / Pencil / Send Now always, subsequent rows reveal them on hover. Clear All in the header. "Send Now" interrupts the current turn when busy. Edit pops the queued message back into the composer with its chips and attachments intact. Queued messages don't enter the transcript until they actually dispatch, so they can't split an agent's streaming response.
-- **Three-state send button**: paper-plane when idle → `list-end` icon when the agent is busy and the composer has typed / chip content (pressing enqueues) → stop square when the agent is busy and the composer is empty (pressing cancels).
-- Zed-styled tool call rendering: read/search/fetch/think tools show as one-line inline rows; edit/bash/permission tools get a full card.
-- Permission prompts surface as in-dock dialogs with approve / reject buttons.
-- **Inline chip composer** (Zed-style): attachments become inline pills in the prompt `TextEdit`, interleaved with typed text. Backspace / delete / arrow keys treat each chip as a single atomic glyph. Sent user bubbles with chips render the same inline layout via `RichTextLabel`.
-- **Thread menu** shows a relative-time suffix (`· 2h`, `· 3d`, `· 2026-04-12`) next to every session, sourced from the thread cache file's mtime so inactive sessions stay accurate. Session titles auto-derive from the first user message when the adapter doesn't provide one; a **Delete ▸** submenu at the bottom deletes any thread with a confirmation dialog.
-- Attachments you can drop into a prompt:
-  - the currently edited scene,
-  - the selected Scene Tree nodes,
-  - selected FileSystem files,
-  - pasted screenshots (saved as PNG under `addons/godette_agent/attachments/`, `.gdignore`d out of the editor's resource system).
-- Right-click entry points:
-  - FileSystem dock → `Ask Agent About Selection`
-  - Scene Tree dock → `Ask Agent About Nodes`
+## What it solves
 
-## Files
+Godot had no in-editor agent. This plugin makes the editor itself the chat surface: attach scene nodes, FileSystem files, or pasted screenshots as context; the agent edits your project in place. No copy-paste between a separate chat app and the editor.
 
-```
-addons/godette_agent/
-├── plugin.gd                       editor plugin entry point
-├── agent_dock.gd                   dock UI, session state, ACP event handlers
-├── acp_connection.gd               stdio JSON-RPC transport for ACP adapters
-├── markdown.gd                     CommonMark + GFM subset parser → event stream
-├── markdown_render.gd              event-stream renderer → Godot Controls
-├── markdown_selection_manager.gd   cross-block drag selection + copy/clear
-├── session_store.gd                session persistence + per-thread cache I/O
-├── text_block.gd                   TextParagraph-based widget with span styling
-├── virtual_feed.gd                 viewport-virtualised scroll feed (only
-│                                   renders entries intersecting the visible
-│                                   range; O(log n) y lookup)
-├── composer_prompt_input.gd        chip-aware TextEdit (inline attachment
-│                                   pills, image paste, Enter to submit)
-├── composer_chip_overlay.gd        draws chip panels on top of the prompt
-│                                   input's reserved anchor+NBSP runs
-├── composer_context.gd             pure transforms: chip label/tooltip,
-│                                   attachments→ACP prompt-block builder
-├── loading_scanner.gd              top bar progress indicator
-├── filesystem_context_menu.gd      FileSystem right-click integration
-├── scene_tree_context_menu.gd      Scene Tree right-click integration
-├── icons/                          editor-theme-tinted SVGs (send / stop /
-│                                   list-end queue / todo pending / progress
-│                                   / complete, etc)
-└── attachments/                    pasted clipboard PNGs (gdignored)
-```
+## Credits
 
-## Requirements
-
-Install the local ACP adapters before opening Godot:
-
-```bash
-npm install -g @agentclientprotocol/claude-agent-acp @zed-industries/codex-acp
-```
-
-The plugin looks for these adapters in the standard global npm location and falls back to `npx` when that path isn't resolvable.
-
-## Run it
-
-1. Open this folder in Godot 4.6.x.
-2. Enable `Agent Godette` in `Project → Project Settings → Plugins`.
-3. Open the `Agent` dock.
-4. Choose `Claude Agent` or `Codex CLI`.
-5. Create a session and send a prompt.
-
-## Session data
-
-Sessions are persisted outside the project tree, in Godot's user-data directory:
-
-- **Windows:** `%APPDATA%/Godot/app_userdata/<project>/godette_sessions.json` + `godette_threads/*.json`
-- **macOS / Linux:** the equivalent Godot `user://` location.
-
-The index file (`godette_sessions.json`) holds per-session metadata; each thread's transcript lives in its own file under `godette_threads/`. Only the active thread is held in memory — switching threads hydrates the new one and dehydrates the old one back to disk.
-
-## Notes
-
-- Transport is ACP over stdio, matching Zed's external-agent design. No HTTP, no separate bridge process.
-- Streamed output and session isolation are fully working. Multi-session parallel turns, queued prompts, and mid-stream cancellation all handled.
-- **Transcript cache is the source of truth** (mirrors Zed's SQLite-backed approach): the on-disk per-thread JSON files are authoritative, and `session/load` replay events from reconnecting adapters are suppressed so they don't double-append on top of cached history.
-- **Editor FileSystem auto-refresh**: after the agent writes a file (via `fs/write_text_file`) Godette calls `EditorFileSystem.update_file(res://…)` to patch that single path in the resource cache; on every `prompt_finished` it also runs a full `EditorFileSystem.scan()` to catch Bash-initiated writes. New files show up in the FileSystem dock without the user having to tab away. `project.godot` still triggers Godot's built-in "reload / ignore" prompt when the agent modifies it — that's a safety feature we can't suppress; nudge the agent to avoid touching `project.godot` unless necessary.
-- **Session timestamps come from the filesystem.** The thread menu's relative-time label (`· 2h`) and the "Recently Updated" ordering both read the thread cache file's `FileAccess.get_modified_time`, not a stored `updated_at` field. `_touch_session` writes the cache on activity to bump mtime; `created_at` is the only timestamp field we still persist explicitly, used as a fallback for sessions that haven't persisted a transcript yet.
-- **Typography follows the editor.** Body / bold / italic / mono fonts come from `EditorFonts` (`main` / `bold` / `italic` / `source`), so markdown rendering tracks whatever UI + code font the user has configured in Godot settings. `SystemFont` fallbacks (Inter, JetBrains Mono) only activate when the plugin is run outside an editor context.
-- **Image attachments are attached as file references, not inline vision.** claude-code-acp routes all file reads through `fs/read_text_file` which is UTF-8-only, so binary bytes (PNG etc.) can't round-trip as inline base64 ImageContent reliably. Pasted screenshots are saved to disk and sent as `resource_link` — the agent surfaces a clear "can't read binary" message when it tries to read them. Describe the image in prose if the model needs to "see" it.
-- `fs/read_text_file` uses the static `FileAccess.get_file_as_bytes` path to avoid a Godot quirk where holding an instance `FileAccess.open` handle on a file the editor also has open poisons the stdio pipe's internal state.
-- File edit review is still minimal — permission requests are shown but the diff UX is much simpler than Zed's side-by-side review. That's on the roadmap.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+Standing on [Zed](https://github.com/zed-industries/zed)'s shoulders — the ACP transport and most of the UX (plan / queue drawers, composer chips, transcript persistence, tool-call rendering) are modeled directly on Zed's external-agent implementation.

@@ -1,0 +1,13 @@
+[gd_scene format=3 uid="uid://bjwwtg4eo8m4"]
+
+[node name="test" type="Node2D" unique_id=22737388]
+
+[node name="Node3D" type="Node3D" parent="." unique_id=1783630626]
+
+[node name="Control" type="Control" parent="." unique_id=1919195720]
+layout_mode = 3
+anchors_preset = 0
+offset_right = 40.0
+offset_bottom = 40.0
+
+[node name="AudioStreamPlayer" type="AudioStreamPlayer" parent="Control" unique_id=874017506]

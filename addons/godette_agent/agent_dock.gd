@@ -61,12 +61,6 @@ const RECENT_SESSION_LIMIT := 6
 # Session persistence paths + size caps live on GodetteSessionStore.
 # Only the Timer debounce interval is a dock concern (Timer is a Node).
 const SESSION_PERSIST_DEBOUNCE_SEC := 0.4
-const THREAD_MENU_SESSION_ID_OFFSET := 1000
-# "Delete <session>" row IDs live in their own numeric range so the
-# single id_pressed dispatch can tell open-vs-delete apart without a
-# second signal hookup. Using 10000 gives us room for ~9000 sessions
-# in the open range before the two windows collide.
-const THREAD_MENU_DELETE_ID_OFFSET := 10000
 const ADD_MENU_AGENT_ID_OFFSET := 2000
 const AGENTS := [
 	{"id": "claude_agent", "label": "Claude Agent"},
@@ -75,7 +69,18 @@ const AGENTS := [
 
 var editor_interface: EditorInterface
 var thread_icon: TextureRect
-var thread_menu: MenuButton
+# Header button that shows the current thread's title; clicking it opens
+# the session picker (GodetteSessionMenu). Was a MenuButton driving a
+# native PopupMenu — swapped to a plain Button because PopupMenu can't
+# render per-row hover controls.
+var thread_menu: Button
+var session_popup: GodetteSessionMenu
+# Flag set when a delete is initiated from the session popup. The
+# ConfirmationDialog steals focus and closes the popup automatically;
+# this flag makes the dialog's confirmed / canceled handlers re-show
+# the popup after the eviction so the updated list appears in place
+# without the user having to reopen it manually.
+var session_popup_reopen_after_delete: bool = false
 var thread_switcher_button: Button
 var add_menu: MenuButton
 var message_scroll: ScrollContainer
@@ -96,6 +101,20 @@ var queue_expanded_sessions: Dictionary = {}
 var prompt_input: TextEdit
 var composer_options_bar: HBoxContainer
 var composer_chip_overlay: GodetteComposerChipOverlay
+# Scene Tree focus indicator — tracks the user's current SceneTree
+# selection and optionally injects that node as implicit context into
+# the next prompt. Eye toggle decides whether the context is sent.
+var focus_indicator_container: GodetteFocusRing
+var focus_indicator_inner: HBoxContainer
+var focus_eye_button: Button
+var focus_icon_rect: TextureRect
+var focus_path_label: Label
+var focus_include_enabled: bool = true
+var focus_selected_node: Node = null
+# Spacer between the focus indicator (left) and the dynamic selectors +
+# send button (right). Kept as a member so _refresh_composer_options can
+# skip it when rebuilding the selector row instead of recreating it.
+var composer_options_spacer: Control
 var send_button: Button
 # Left-aligned badge in composer_options_bar showing how many follow-up
 # prompts are queued behind the current streaming turn. Hidden when the
@@ -187,6 +206,21 @@ var editor_fs_scan_pending := false
 
 func configure(p_editor_interface: EditorInterface) -> void:
 	editor_interface = p_editor_interface
+	# Subscribe to SceneTree selection changes so the focus indicator
+	# tracks live. Deferred to a call_deferred because `_build_ui` may
+	# not have run yet if `configure` fires earlier than `_ready`.
+	call_deferred("_wire_scene_selection_listener")
+	call_deferred("_refresh_focus_indicator")
+
+
+func _wire_scene_selection_listener() -> void:
+	if editor_interface == null:
+		return
+	var selection := editor_interface.get_selection()
+	if selection == null:
+		return
+	if not selection.selection_changed.is_connected(_on_scene_selection_changed):
+		selection.selection_changed.connect(_on_scene_selection_changed)
 
 
 # --- Editor theme helpers --------------------------------------------------
@@ -423,14 +457,24 @@ func _build_ui() -> void:
 	thread_icon.texture = _agent_icon_texture(DEFAULT_AGENT_ID)
 	header_row.add_child(thread_icon)
 
-	thread_menu = MenuButton.new()
+	thread_menu = Button.new()
 	thread_menu.flat = true
 	thread_menu.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	thread_menu.alignment = HORIZONTAL_ALIGNMENT_LEFT
 	thread_menu.clip_text = true
 	thread_menu.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
-	thread_menu.get_popup().id_pressed.connect(Callable(self, "_on_thread_menu_id_pressed"))
+	thread_menu.focus_mode = Control.FOCUS_NONE
+	thread_menu.pressed.connect(Callable(self, "_show_session_popup"))
 	header_row.add_child(thread_menu)
+
+	# Custom popup replaces the native PopupMenu so each row can host an
+	# inline hover-only trash icon (matches Zed's thread history list).
+	# Parented to the dock so it inherits the editor theme and gets cleaned
+	# up with us.
+	session_popup = GodetteSessionMenu.new()
+	session_popup.session_chosen.connect(Callable(self, "_on_session_popup_chosen"))
+	session_popup.session_delete_requested.connect(Callable(self, "_on_session_popup_delete_requested"))
+	add_child(session_popup)
 
 	status_label = Label.new()
 	status_label.text = "Starting..."
@@ -652,12 +696,81 @@ func _build_ui() -> void:
 	# its width actually changes.
 	composer_options_bar.resized.connect(Callable(self, "_on_composer_bar_resized"))
 
+	# Scene Tree focus indicator on the LEFT of the options bar. Shows
+	# the currently selected SceneTree node with an eye toggle — open
+	# means "include this node's context in the next prompt", closed
+	# means "ignore the selection for now". Hidden entirely when
+	# nothing is selected.
+	focus_indicator_container = GodetteFocusRing.new()
+	focus_indicator_container.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
+	# Match the selector menus' height (30 px, set in _reflow_composer_selectors)
+	# so the focus ring visually aligns with the bar's baseline controls.
+	focus_indicator_container.custom_minimum_size = Vector2(0, 30)
+	# Clicks anywhere on the ring flip the eye — handled in _on_focus_ring_gui_input.
+	focus_indicator_container.gui_input.connect(Callable(self, "_on_focus_ring_gui_input"))
+	composer_options_bar.add_child(focus_indicator_container)
+
+	focus_indicator_inner = HBoxContainer.new()
+	# Negative separation compensates for two invisible gaps:
+	#   1. Godot editor SVG icons ship with ~1-2 px of transparent
+	#      padding baked into the glyph bounding box.
+	#   2. Labels in the editor font have a small left-side bearing on
+	#      the first character.
+	# Together those make even zero-separation layouts read ~4 px wider
+	# than they look in the Figma spec. Pulling the inner HBox by -4 px
+	# lands the visible glyph + label at what feels like "touching".
+	focus_indicator_inner.add_theme_constant_override("separation", -4)
+	# HBox itself ignores mouse so clicks on its empty margins fall through
+	# to the outer ring container (which handles the eye-toggle hotzone).
+	focus_indicator_inner.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	focus_indicator_container.add_child(focus_indicator_inner)
+
+	focus_eye_button = Button.new()
+	focus_eye_button.flat = true
+	focus_eye_button.toggle_mode = true
+	focus_eye_button.button_pressed = true
+	focus_eye_button.focus_mode = Control.FOCUS_NONE
+	focus_eye_button.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
+	focus_eye_button.custom_minimum_size = Vector2(22, 22)
+	focus_eye_button.toggled.connect(Callable(self, "_on_focus_eye_toggled"))
+	focus_indicator_inner.add_child(focus_eye_button)
+
+	focus_icon_rect = TextureRect.new()
+	# Editor icons are native 16×16 glyphs — render at 18 × editor_scale
+	# so they track the label font on high-DPI and don't look like a
+	# tiny dot beside the node name.
+	var focus_icon_scale: float = 1.0
+	if editor_interface != null:
+		focus_icon_scale = editor_interface.get_editor_scale()
+	var focus_icon_px: float = 18.0 * focus_icon_scale
+	focus_icon_rect.custom_minimum_size = Vector2(focus_icon_px, focus_icon_px)
+	focus_icon_rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	# KEEP_ASPECT (not KEEP_ASPECT_CENTERED) scales the native 16×16 icon
+	# up to the full TextureRect bounds instead of leaving blank padding
+	# around it — without that, the padding reads as extra gap between
+	# the icon and the label.
+	focus_icon_rect.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT
+	focus_icon_rect.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	# Let clicks on the icon fall through to the outer ring (hot zone).
+	focus_icon_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	focus_indicator_inner.add_child(focus_icon_rect)
+
+	focus_path_label = Label.new()
+	# Autosize to content. The previous 120px min + clip + ellipsis was
+	# mis-trimming short strings like "No focus" into "No focu…". Node
+	# names are usually short; if a pathological long name ever shows
+	# up we can revisit with a max-width cap.
+	focus_path_label.text_overrun_behavior = TextServer.OVERRUN_NO_TRIMMING
+	# Let clicks on the name text fall through to the ring hotzone.
+	focus_path_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	focus_indicator_inner.add_child(focus_path_label)
+
 	# Spacer pushes the send button to the right. The old "N queued"
 	# label lived here too; queue state now renders in `queue_drawer`
 	# above the composer (see _refresh_queue_drawer).
-	var options_spacer := Control.new()
-	options_spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	composer_options_bar.add_child(options_spacer)
+	composer_options_spacer = Control.new()
+	composer_options_spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	composer_options_bar.add_child(composer_options_spacer)
 
 	send_button = Button.new()
 	send_button.text = ""
@@ -670,6 +783,13 @@ func _build_ui() -> void:
 
 	_refresh_add_menu()
 	_refresh_composer_options()
+	# Focus indicator's initial state. `configure()` runs BEFORE
+	# `_build_ui` (plugin.gd creates the dock then immediately calls
+	# configure before add_control_to_dock), so the deferred refresh
+	# fired from configure may land before widgets exist. Call
+	# directly here to guarantee the widget is populated the moment
+	# the dock is visible.
+	_refresh_focus_indicator()
 
 
 func _make_button(text: String, callable: Callable) -> Button:
@@ -3618,6 +3738,13 @@ func _send_prompt() -> void:
 	# when the current turn ends. `_dispatch_next_prompt` already no-ops
 	# while busy, so calling it unconditionally is safe.
 	var blocks: Array = _build_prompt_blocks(prompt, attachments)
+	# SceneTree focus context: when the eye is open and a node is
+	# selected in the editor, append a text block describing that node
+	# so the agent has implicit "what the user is looking at right now"
+	# context without the user having to chip-attach it explicitly.
+	var focus_block: Dictionary = _build_focus_context_block()
+	if not focus_block.is_empty():
+		blocks.append(focus_block)
 	var queue: Array = session.get("queued_prompts", [])
 	# Carry enough on the queue entry to support Zed's three per-row
 	# actions (edit / send-now / delete):
@@ -4789,6 +4916,140 @@ func _build_prompt_blocks(prompt: String, current_attachments: Array) -> Array:
 	return ComposerContextScript.build_prompt_blocks(prompt, current_attachments)
 
 
+func _build_focus_context_block() -> Dictionary:
+	# Empty dict = "no focus context to inject". Returned when the eye
+	# is closed, no node is selected, or the selected node has been
+	# freed since last refresh.
+	if not focus_include_enabled:
+		return {}
+	if focus_selected_node == null or not is_instance_valid(focus_selected_node):
+		return {}
+	var node := focus_selected_node
+	var scene_root: Node = editor_interface.get_edited_scene_root() if editor_interface != null else null
+	var lines: Array = []
+	lines.append("Currently focused in the Scene Tree (implicit context — user had this node selected when sending):")
+	lines.append("- Name: %s" % str(node.name))
+	lines.append("- Class: %s" % node.get_class())
+	var relative_path := "."
+	if scene_root != null and node != scene_root and scene_root.is_ancestor_of(node):
+		relative_path = str(scene_root.get_path_to(node))
+	lines.append("- Path: %s" % relative_path)
+	var script_variant = node.get_script()
+	if script_variant is Script:
+		var script_path := (script_variant as Script).resource_path
+		if not script_path.is_empty():
+			lines.append("- Script: %s" % script_path)
+	var scene_file := node.scene_file_path if "scene_file_path" in node else ""
+	if not scene_file.is_empty():
+		lines.append("- Scene file: %s" % scene_file)
+	lines.append("- Children: %d" % node.get_child_count())
+	return {"type": "text", "text": "\n".join(lines)}
+
+
+func _on_scene_selection_changed() -> void:
+	_refresh_focus_indicator()
+
+
+func _on_focus_eye_toggled(pressed: bool) -> void:
+	# Toggle is "include in prompts". When pressed=true the eye reads
+	# as open, icon + label show in full color; when false the whole
+	# indicator dims so the user can still see WHICH node is focused
+	# but understands it won't be sent.
+	focus_include_enabled = pressed
+	_refresh_focus_indicator()
+
+
+func _on_focus_ring_gui_input(event: InputEvent) -> void:
+	# The whole ring is a hot zone for the eye toggle — clicks that don't
+	# land on the eye button itself still flip the include flag. Flipping
+	# `button_pressed` routes through the button's `toggled` signal, so
+	# `_on_focus_eye_toggled` runs exactly once and the icon swap stays in
+	# sync with the state.
+	if event is InputEventMouseButton:
+		var mb: InputEventMouseButton = event
+		if mb.button_index == MOUSE_BUTTON_LEFT and mb.pressed and not mb.is_echo():
+			if focus_eye_button != null:
+				focus_eye_button.button_pressed = not focus_eye_button.button_pressed
+			if focus_indicator_container != null:
+				focus_indicator_container.accept_event()
+
+
+func _refresh_focus_indicator() -> void:
+	if focus_indicator_container == null or focus_path_label == null:
+		return
+	focus_indicator_container.visible = true
+
+	# Eye button is always there; its icon swaps with the include flag.
+	if focus_eye_button != null:
+		var eye_open := _editor_theme_icon("GuiVisibilityVisible")
+		var eye_closed := _editor_theme_icon("GuiVisibilityHidden")
+		focus_eye_button.icon = eye_open if focus_include_enabled else eye_closed
+		focus_eye_button.tooltip_text = (
+			"Focus node is INCLUDED in the next prompt — click to ignore"
+			if focus_include_enabled
+			else "Focus node is IGNORED — click to include in the next prompt"
+		)
+
+	var selection = editor_interface.get_selection() if editor_interface != null else null
+	var selected_nodes: Array = selection.get_selected_nodes() if selection != null else []
+
+	if selected_nodes.is_empty():
+		# No node selected — show the indicator in a muted state with a
+		# placeholder so the user knows the feature exists and can
+		# find the eye toggle. The eye still responds so the user can
+		# flip the include-preference even before picking a node.
+		focus_selected_node = null
+		focus_icon_rect.texture = _editor_theme_icon("Node")
+		focus_path_label.text = "No focus"
+		focus_path_label.tooltip_text = "Select a node in the Scene Tree to attach it as context"
+		focus_indicator_container.modulate = Color(1, 1, 1, 0.45)
+		focus_indicator_container.set_active(false)
+		return
+
+	# Multi-select: show the first + a "(+N)" suffix. The focus context
+	# injected on send still uses only the first, matching the
+	# single-focus mental model.
+	var primary: Node = selected_nodes[0]
+	focus_selected_node = primary
+
+	# Label shows the node's NAME (the leaf identifier, same text the
+	# Scene Tree dock itself prints). Full path + class land in the
+	# tooltip so the user can disambiguate when multiple nodes share a
+	# name.
+	var node_name: String = str(primary.name)
+	var label_text: String = node_name
+	if selected_nodes.size() > 1:
+		label_text = "%s  (+%d)" % [label_text, selected_nodes.size() - 1]
+	focus_path_label.text = label_text
+
+	var scene_root: Node = editor_interface.get_edited_scene_root()
+	var relative_path: String = "."
+	if scene_root != null and primary != scene_root and scene_root.is_ancestor_of(primary):
+		relative_path = str(scene_root.get_path_to(primary))
+	focus_path_label.tooltip_text = "%s  ·  %s\nEye toggle decides whether this node is included in the next prompt." % [relative_path, primary.get_class()]
+
+	# Icon: use editor-theme class icon for the node (Node2D / Button /
+	# CollisionShape3D, etc), falling back to the generic Node glyph.
+	var theme: Theme = editor_interface.get_editor_theme() if editor_interface != null else null
+	if theme != null:
+		var cls := primary.get_class()
+		if theme.has_icon(cls, "EditorIcons"):
+			focus_icon_rect.texture = theme.get_icon(cls, "EditorIcons")
+		elif theme.has_icon("Node", "EditorIcons"):
+			focus_icon_rect.texture = theme.get_icon("Node", "EditorIcons")
+
+	# Grey out the whole indicator when the eye is closed so the user
+	# sees at a glance that this selection won't be sent.
+	focus_indicator_container.modulate = Color(1, 1, 1, 1) if focus_include_enabled else Color(1, 1, 1, 0.45)
+
+	# Marching-ants ring animates only when the selection will actually
+	# be injected (node selected AND eye open). Eye-closed keeps the
+	# ring static so the animation doesn't compete with the dim modulate.
+	var accent: Color = _editor_color("accent_color", "Editor", Color(0.55, 0.78, 1.0, 1.0))
+	focus_indicator_container.set_stroke_color(accent)
+	focus_indicator_container.set_active(focus_include_enabled)
+
+
 func _refresh_composer_context() -> void:
 	if composer_chip_overlay == null or prompt_input == null:
 		return
@@ -5096,49 +5357,85 @@ func _flush_thread_menu_refresh() -> void:
 		return
 
 	thread_menu.text = _current_thread_title()
-	var popup := thread_menu.get_popup()
-	popup.clear()
 
+	# Only rebuild the popup if it's actually on screen. When closed, the
+	# next `_show_session_popup` call does a fresh populate anyway —
+	# skipping work here keeps deletion / session-update bursts cheap.
+	if session_popup != null and session_popup.visible:
+		_populate_session_popup()
+
+
+func _build_session_popup_groups() -> Array:
+	# Mirrors the old PopupMenu layout: "Recently Updated" (capped at
+	# RECENT_SESSION_LIMIT), followed by "All Sessions" for the remainder.
+	# Using the same two-section structure keeps the user's spatial
+	# memory ("this thread was near the top") stable across the refactor.
+	var groups: Array = []
 	if sessions.is_empty():
-		return
+		return groups
 
 	var recent_indices: Array = _recent_session_indices(RECENT_SESSION_LIMIT)
 	var listed: Dictionary = {}
-	popup.add_item("Recently Updated", -1)
-	popup.set_item_disabled(popup.get_item_count() - 1, true)
+	var recent_group: Dictionary = {"header": "Recently Updated", "indices": []}
 	for session_index_variant in recent_indices:
 		var session_index: int = int(session_index_variant)
-		var recent_session: Dictionary = sessions[session_index]
-		popup.add_icon_item(
-			_agent_icon_texture(str(recent_session.get("agent_id", DEFAULT_AGENT_ID)), THREAD_MENU_AGENT_ICON_SIZE),
-			_thread_menu_label(session_index),
-			THREAD_MENU_SESSION_ID_OFFSET + session_index
-		)
-		popup.set_item_tooltip(popup.get_item_count() - 1, _thread_menu_tooltip(session_index))
+		recent_group["indices"].append(session_index)
 		listed[session_index] = true
+	if not recent_group["indices"].is_empty():
+		groups.append(recent_group)
 
 	if sessions.size() > recent_indices.size():
-		popup.add_separator()
-		popup.add_item("All Sessions", -1)
-		popup.set_item_disabled(popup.get_item_count() - 1, true)
+		var all_group: Dictionary = {"header": "All Sessions", "indices": []}
 		for session_index in range(sessions.size()):
 			if listed.has(session_index):
 				continue
-			var session: Dictionary = sessions[session_index]
-			popup.add_icon_item(
-				_agent_icon_texture(str(session.get("agent_id", DEFAULT_AGENT_ID)), THREAD_MENU_AGENT_ICON_SIZE),
-				_thread_menu_label(session_index),
-				THREAD_MENU_SESSION_ID_OFFSET + session_index
-			)
-			popup.set_item_tooltip(popup.get_item_count() - 1, _thread_menu_tooltip(session_index))
+			all_group["indices"].append(session_index)
+		if not all_group["indices"].is_empty():
+			groups.append(all_group)
 
-	# "Delete" submenu at the bottom, mirroring the full session list.
-	# Each submenu entry deletes that specific thread — gives one-click
-	# access to delete any session, not just the currently active one.
-	# Separator above so it doesn't read as another session row.
-	popup.add_separator()
-	var delete_submenu := _build_delete_submenu()
-	popup.add_submenu_node_item("Delete", delete_submenu)
+	return groups
+
+
+func _populate_session_popup() -> void:
+	if session_popup == null:
+		return
+	var context: Dictionary = {
+		"editor_theme": editor_interface.get_editor_theme() if editor_interface != null else null,
+		"agent_icon_for": Callable(self, "_session_popup_agent_icon"),
+		"label_for": Callable(self, "_thread_menu_label"),
+		"tooltip_for": Callable(self, "_thread_menu_tooltip"),
+	}
+	session_popup.populate(_build_session_popup_groups(), context)
+
+
+func _session_popup_agent_icon(session_index: int) -> Texture2D:
+	if session_index < 0 or session_index >= sessions.size():
+		return null
+	var agent_id: String = str(sessions[session_index].get("agent_id", DEFAULT_AGENT_ID))
+	return _agent_icon_texture(agent_id, THREAD_MENU_AGENT_ICON_SIZE)
+
+
+func _show_session_popup() -> void:
+	if session_popup == null or thread_switcher_button == null:
+		return
+	_populate_session_popup()
+	# Anchor under the history / switcher button so the popup reads as
+	# belonging to the right-hand icon (visually clearer than anchoring to
+	# the long title button).
+	session_popup.popup_at_button(thread_switcher_button)
+
+
+func _on_session_popup_chosen(session_index: int) -> void:
+	_switch_session(session_index)
+
+
+func _on_session_popup_delete_requested(session_index: int) -> void:
+	# Set the reopen flag BEFORE showing the dialog. The dialog's
+	# confirmed / canceled paths clear the flag and call
+	# `_show_session_popup` again so the updated list pops back without
+	# the user having to click the thread switcher a second time.
+	session_popup_reopen_after_delete = true
+	_confirm_delete_session(session_index)
 
 
 func _refresh_add_menu() -> void:
@@ -5498,8 +5795,14 @@ func _refresh_composer_options() -> void:
 	if composer_options_bar == null:
 		return
 
+	# Persistent children — focus indicator (left), spacer, send button
+	# (right). Only the dynamic selector menus between them get rebuilt.
 	for child in composer_options_bar.get_children():
 		if child == send_button:
+			continue
+		if child == focus_indicator_container:
+			continue
+		if child == composer_options_spacer:
 			continue
 		composer_options_bar.remove_child(child)
 		child.queue_free()
@@ -6754,48 +7057,6 @@ func _current_agent_id() -> String:
 	return str(sessions[current_session_index].get("agent_id", selected_agent_id))
 
 
-func _on_thread_menu_id_pressed(item_id: int) -> void:
-	if item_id >= THREAD_MENU_DELETE_ID_OFFSET:
-		# Delete submenu entry — ID range is [DELETE_OFFSET, ∞).
-		var delete_index: int = item_id - THREAD_MENU_DELETE_ID_OFFSET
-		_confirm_delete_session(delete_index)
-		return
-	if item_id < THREAD_MENU_SESSION_ID_OFFSET:
-		return
-
-	var session_index: int = item_id - THREAD_MENU_SESSION_ID_OFFSET
-	_switch_session(session_index)
-
-
-func _build_delete_submenu() -> PopupMenu:
-	var submenu := PopupMenu.new()
-	submenu.name = "DeleteSubmenu"
-	submenu.id_pressed.connect(Callable(self, "_on_thread_menu_id_pressed"))
-	# List every session in the same order as the parent menu so the
-	# user's spatial mapping "row here = delete that" stays consistent.
-	var recent_indices: Array = _recent_session_indices(RECENT_SESSION_LIMIT)
-	var listed: Dictionary = {}
-	for session_index_variant in recent_indices:
-		var session_index: int = int(session_index_variant)
-		submenu.add_icon_item(
-			_agent_icon_texture(str(sessions[session_index].get("agent_id", DEFAULT_AGENT_ID)), THREAD_MENU_AGENT_ICON_SIZE),
-			_thread_menu_label(session_index),
-			THREAD_MENU_DELETE_ID_OFFSET + session_index
-		)
-		submenu.set_item_tooltip(submenu.get_item_count() - 1, "Delete %s" % _session_display_title(sessions[session_index]))
-		listed[session_index] = true
-	for session_index in range(sessions.size()):
-		if listed.has(session_index):
-			continue
-		submenu.add_icon_item(
-			_agent_icon_texture(str(sessions[session_index].get("agent_id", DEFAULT_AGENT_ID)), THREAD_MENU_AGENT_ICON_SIZE),
-			_thread_menu_label(session_index),
-			THREAD_MENU_DELETE_ID_OFFSET + session_index
-		)
-		submenu.set_item_tooltip(submenu.get_item_count() - 1, "Delete %s" % _session_display_title(sessions[session_index]))
-	return submenu
-
-
 func _confirm_delete_session(session_index: int) -> void:
 	if session_index < 0 or session_index >= sessions.size():
 		return
@@ -6817,29 +7078,38 @@ func _confirm_delete_session(session_index: int) -> void:
 	dialog.confirmed.connect(func():
 		_evict_session(target_index)
 		dialog.queue_free()
+		_maybe_reopen_session_popup_after_delete()
 	)
-	dialog.canceled.connect(func(): dialog.queue_free())
-	dialog.close_requested.connect(func(): dialog.queue_free())
+	dialog.canceled.connect(func():
+		dialog.queue_free()
+		_maybe_reopen_session_popup_after_delete()
+	)
+	dialog.close_requested.connect(func():
+		dialog.queue_free()
+		_maybe_reopen_session_popup_after_delete()
+	)
 	dialog.popup_centered()
 
 
+func _maybe_reopen_session_popup_after_delete() -> void:
+	# Only reopen if the delete originated from a row in the session
+	# popup. Deletes triggered from other entry points (if any are added
+	# later) won't force the popup to appear unsolicited.
+	if not session_popup_reopen_after_delete:
+		return
+	session_popup_reopen_after_delete = false
+	# Deferred so the dialog's Window finishes tearing down before we
+	# try to open our own popup — on some platforms showing a new popup
+	# in the same frame as a dialog close causes the new one to inherit
+	# the "closing" state and never appear.
+	call_deferred("_show_session_popup")
+
+
 func _on_thread_switcher_pressed() -> void:
-	# Forward to the existing thread_menu popup so there's a single source
-	# of truth for the thread list UI. Anchor the popup directly beneath
-	# the switcher button so it reads as coming from the clicked icon,
-	# not from wherever the cursor happened to be.
-	if thread_menu == null or thread_switcher_button == null:
-		return
-	var popup := thread_menu.get_popup()
-	if popup == null:
-		return
-	var screen_pos := thread_switcher_button.get_screen_position()
-	var y_offset := int(thread_switcher_button.size.y)
-	popup.popup(Rect2i(
-		int(screen_pos.x),
-		int(screen_pos.y) + y_offset,
-		0, 0
-	))
+	# The switcher icon and the thread title button both open the same
+	# session popup — one source of truth, anchored under the switcher so
+	# the popup reads as coming from the right-hand icon.
+	_show_session_popup()
 
 
 func _on_add_menu_id_pressed(item_id: int) -> void:
