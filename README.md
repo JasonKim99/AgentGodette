@@ -8,11 +8,11 @@ v0.3.1
 
 **Per-session model, mode, and reasoning** — switch model, reasoning effort, and permission mode per thread, right from the composer bar.
 
-<img width="3840" height="2076" alt="Snipaste_2026-04-24_22-18-27" src="https://github.com/user-attachments/assets/832df8ad-b280-4d42-8f54-8d170a200d58" />
+<img width="3840" height="2076" alt="Per-session model selector" src="https://raw.githubusercontent.com/JasonKim99/AgentGodette/master/addons/godette_agent/docs/model_select.png" />
 
 **Plan · Queue · SceneTree focus** — the agent's TodoWrite plan collapses above the composer, queued follow-up prompts stack underneath it, and any node you've selected in the SceneTree auto-attaches as implicit context on send.
 
-<img width="3840" height="2076" alt="Snipaste_2026-04-24_22-19-50" src="https://github.com/user-attachments/assets/1e804118-7a33-496e-bdf9-7094b0407733" />
+<img width="3840" height="2076" alt="Plan drawer, Queue drawer, and SceneTree focus indicator" src="https://raw.githubusercontent.com/JasonKim99/AgentGodette/master/addons/godette_agent/docs/plan+queue+select%20node.png" />
 
 
 ## What it is
