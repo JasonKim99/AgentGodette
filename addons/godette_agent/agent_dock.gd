@@ -75,12 +75,6 @@ var thread_icon: TextureRect
 # render per-row hover controls.
 var thread_menu: Button
 var session_popup: GodetteSessionMenu
-# Flag set when a delete is initiated from the session popup. The
-# ConfirmationDialog steals focus and closes the popup automatically;
-# this flag makes the dialog's confirmed / canceled handlers re-show
-# the popup after the eviction so the updated list appears in place
-# without the user having to reopen it manually.
-var session_popup_reopen_after_delete: bool = false
 var thread_switcher_button: Button
 var add_menu: MenuButton
 var message_scroll: ScrollContainer
@@ -821,17 +815,30 @@ func _touch_session(session_index: int) -> void:
 	if session_index < 0 or session_index >= sessions.size():
 		return
 
-	# Bump the thread cache file's mtime on disk by rewriting it.
-	# The menu label reads `FileAccess.get_modified_time(thread_cache_path)`
-	# directly as the "updated_at" source of truth, so this write IS the
-	# timestamp update — no in-memory field to keep in sync.
-	var session: Dictionary = sessions[session_index]
-	if bool(session.get("hydrated", false)):
-		SessionStoreScript.write_thread_cache(session)
-
+	# We used to synchronously rewrite the full thread cache here on every
+	# touch so `FileAccess.get_modified_time` would bump for the menu's
+	# "Recently Updated" label. That was 10-50 ms per chunk (and up to
+	# ~1 s under Windows Defender stalls) — the stutter the user saw
+	# during streaming traced straight to this call. The debounced
+	# `_schedule_persist_state` below handles the disk write via the same
+	# `write_thread_cache` path, just at turn boundaries; a ≤0.4 s
+	# mtime lag is imperceptible in the menu.
 	if thread_menu != null:
 		_refresh_thread_menu()
 	_schedule_persist_state()
+
+
+func _any_session_streaming() -> bool:
+	# True while any ACP turn is mid-flight. Used to gate the persist
+	# debounce off during streaming — writing 19 sessions' worth of
+	# JSON + disk flush costs 20-60 ms each tick and stacks into
+	# visible stutter.
+	for session_variant in sessions:
+		if typeof(session_variant) != TYPE_DICTIONARY:
+			continue
+		if bool((session_variant as Dictionary).get("busy", false)):
+			return true
+	return false
 
 
 # Thin wrapper around GodetteSessionStore.persist that pins the dock's
@@ -849,6 +856,16 @@ func _persist_state() -> void:
 
 func _schedule_persist_state() -> void:
 	persist_dirty = true
+	# Skip while any session is actively streaming. Writing the full
+	# transcript + metadata index on every tool_call / chunk / plan
+	# update blocks the main thread long enough to cause the "smooth
+	# → stall → smooth" pattern users see during long agent turns.
+	# Turn endings (`_on_connection_prompt_finished` /
+	# `_on_connection_prompt_error`) explicitly flush, so we never
+	# lose a completed turn's state — only the partial mid-stream
+	# state that's already in memory.
+	if _any_session_streaming():
+		return
 	if persist_timer == null or not is_instance_valid(persist_timer):
 		_flush_persist_state()
 		return
@@ -1768,18 +1785,15 @@ func _build_tool_call_card(entry: Dictionary, awaiting_permission: bool) -> Cont
 
 	# Only a narrow set of statuses still warrant an inline text chip:
 	# the ones where "colour-on-icon alone" doesn't carry enough
-	# actionability. Completed / pending / running / canceled render
-	# as icon-tint-only so they don't clutter the header.
+	# actionability. Failed / completed / pending / running / canceled
+	# all render as icon-tint-only so the header stays uncluttered —
+	# the leading ▸_ glyph already reads red for failed. `Needs approval`
+	# stays as a chip because it's user-actionable, not just state.
 	if awaiting_permission:
 		var approval_chip := Label.new()
 		approval_chip.text = "Needs approval"
 		approval_chip.modulate = Color(0.98, 0.86, 0.52, 0.92)
 		header_row.add_child(approval_chip)
-	elif raw_status == "failed" or raw_status == "error":
-		var failed_chip := Label.new()
-		failed_chip.text = "Failed"
-		failed_chip.modulate = Color(0.95, 0.48, 0.50, 0.95)
-		header_row.add_child(failed_chip)
 
 	var hover_only_controls: Array = []
 
@@ -2347,7 +2361,9 @@ func _build_chat_message_entry(entry: Dictionary, kind: String, entry_index: int
 		if has_chip_segments:
 			padding.add_child(_build_user_bubble_flow(segments_variant as Array))
 		else:
-			padding.add_child(_make_stream_text(body_text, kind))
+			var user_block: GodetteTextBlock = _make_stream_text(body_text, kind)
+			padding.add_child(user_block)
+			_attach_user_bubble_selection(user_block, panel)
 		return user_wrapper
 
 	# Zed assistant message spec (thread_view.rs:4797-4802):
@@ -2522,6 +2538,55 @@ func _attach_assistant_block_right_click(root: Control, entry_index: int) -> voi
 	for child in root.get_children():
 		if child is Control:
 			_attach_assistant_block_right_click(child, entry_index)
+
+
+func _attach_user_bubble_selection(block: GodetteTextBlock, anchor: Control) -> void:
+	# Mirrors what markdown_render does for assistant messages: one
+	# GodetteMarkdownSelection per bubble, registered with the TextBlock
+	# so the manager drives Ctrl+C, outside-click clear, and drag-select.
+	# Manager is parented to a Control inside the bubble so VirtualFeed
+	# frees it with the bubble when the entry scrolls off screen.
+	var MarkdownSelectionScript := preload("res://addons/godette_agent/markdown_selection_manager.gd")
+	var manager: Node = MarkdownSelectionScript.new()
+	manager.name = "UserBubbleSelection"
+	anchor.add_child(manager)
+	manager.register_block(block)
+	# Right-click context menu. User bubbles get a smaller menu than
+	# assistant (no "Copy Agent Response") — Copy Selection + Copy
+	# Message are the only relevant actions here.
+	block.right_clicked.connect(Callable(self, "_on_user_block_right_clicked").bind(block))
+
+
+func _on_user_block_right_clicked(_local_pos: Vector2, source: GodetteTextBlock) -> void:
+	if not is_instance_valid(source):
+		return
+	var popup := PopupMenu.new()
+	popup.hide_on_item_selection = true
+	add_child(popup)
+	popup.close_requested.connect(Callable(self, "_cleanup_context_popup").bind(popup))
+
+	var selected_text: String = source.get_selected_text()
+	var full_text: String = source.get_text()
+	var ID_COPY_SELECTION := 1
+	var ID_COPY_MESSAGE := 2
+	popup.add_item("Copy Selection", ID_COPY_SELECTION)
+	popup.set_item_disabled(popup.get_item_count() - 1, selected_text.is_empty())
+	popup.add_item("Copy Message", ID_COPY_MESSAGE)
+	popup.set_item_disabled(popup.get_item_count() - 1, full_text.is_empty())
+
+	popup.id_pressed.connect(func(id: int) -> void:
+		if id == ID_COPY_SELECTION:
+			if not selected_text.is_empty():
+				DisplayServer.clipboard_set(selected_text)
+		elif id == ID_COPY_MESSAGE:
+			if not full_text.is_empty():
+				DisplayServer.clipboard_set(full_text)
+		_cleanup_context_popup(popup)
+	)
+
+	popup.reset_size()
+	popup.position = DisplayServer.mouse_get_position()
+	popup.popup()
 
 
 func _is_assistant_entry_streaming(entry_index: int) -> bool:
@@ -3864,6 +3929,8 @@ func _dispatch_next_prompt(session_index: int) -> void:
 		_append_transcript_to_session(session_index, "System", "Couldn't send the prompt to the local ACP adapter.")
 		_refresh_send_state()
 		_refresh_status()
+		# busy just flipped false — let the now-ungated debounce run.
+		_schedule_persist_state()
 		return
 
 	_refresh_send_state()
@@ -4402,6 +4469,11 @@ func _on_connection_prompt_finished(agent_id: String, remote_session_id: String,
 	# scans already scheduled this frame.
 	_schedule_editor_fs_scan()
 	_refresh_status()
+	# Turn boundary: persist now that the busy-flag gate has cleared.
+	# Everything mutated mid-stream (chunks, tool calls, plan updates)
+	# was left in memory by `_schedule_persist_state`'s streaming skip;
+	# this is the single flush that writes all of it to disk.
+	_schedule_persist_state()
 
 
 func _on_connection_session_mode_changed(agent_id: String, remote_session_id: String, mode_id: String) -> void:
@@ -5430,12 +5502,14 @@ func _on_session_popup_chosen(session_index: int) -> void:
 
 
 func _on_session_popup_delete_requested(session_index: int) -> void:
-	# Set the reopen flag BEFORE showing the dialog. The dialog's
-	# confirmed / canceled paths clear the flag and call
-	# `_show_session_popup` again so the updated list pops back without
-	# the user having to click the thread switcher a second time.
-	session_popup_reopen_after_delete = true
-	_confirm_delete_session(session_index)
+	# Direct delete — no confirmation dialog. Recreating a thread is a
+	# single click away and the transcript cache file can still be
+	# recovered from disk if the user ever needs to (up until the
+	# managed_attachment cleanup sweep).
+	_evict_session(session_index)
+	# Reopen the popup so the updated list shows in-place. Deferred so
+	# the eviction's `_refresh_thread_menu` call finishes first.
+	call_deferred("_show_session_popup")
 
 
 func _refresh_add_menu() -> void:
@@ -7055,54 +7129,6 @@ func _current_agent_id() -> String:
 	if current_session_index < 0 or current_session_index >= sessions.size():
 		return selected_agent_id
 	return str(sessions[current_session_index].get("agent_id", selected_agent_id))
-
-
-func _confirm_delete_session(session_index: int) -> void:
-	if session_index < 0 or session_index >= sessions.size():
-		return
-	var session: Dictionary = sessions[session_index]
-	var title := _session_display_title(session)
-
-	# ConfirmationDialog as a child of the dock so it inherits the
-	# editor theme + gets cleaned up when the dock is freed. Binding
-	# `session_index` into the confirmed handler freezes the target
-	# so a later `_refresh_thread_menu` re-ordering can't shift
-	# which session gets evicted after the user has already decided.
-	var dialog := ConfirmationDialog.new()
-	dialog.title = "Delete Thread"
-	dialog.dialog_text = "Delete thread \"%s\"?\n\nThis removes the transcript from disk and can't be undone." % title
-	dialog.ok_button_text = "Delete"
-	dialog.get_ok_button().modulate = Color(1.0, 0.55, 0.55, 1.0)
-	add_child(dialog)
-	var target_index := session_index
-	dialog.confirmed.connect(func():
-		_evict_session(target_index)
-		dialog.queue_free()
-		_maybe_reopen_session_popup_after_delete()
-	)
-	dialog.canceled.connect(func():
-		dialog.queue_free()
-		_maybe_reopen_session_popup_after_delete()
-	)
-	dialog.close_requested.connect(func():
-		dialog.queue_free()
-		_maybe_reopen_session_popup_after_delete()
-	)
-	dialog.popup_centered()
-
-
-func _maybe_reopen_session_popup_after_delete() -> void:
-	# Only reopen if the delete originated from a row in the session
-	# popup. Deletes triggered from other entry points (if any are added
-	# later) won't force the popup to appear unsolicited.
-	if not session_popup_reopen_after_delete:
-		return
-	session_popup_reopen_after_delete = false
-	# Deferred so the dialog's Window finishes tearing down before we
-	# try to open our own popup — on some platforms showing a new popup
-	# in the same frame as a dialog close causes the new one to inherit
-	# the "closing" state and never appear.
-	call_deferred("_show_session_popup")
 
 
 func _on_thread_switcher_pressed() -> void:

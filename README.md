@@ -23,6 +23,18 @@ A Godot 4 editor plugin that talks to local ACP (Agent Client Protocol) adapters
 
 Godot had no in-editor agent. This plugin makes the editor itself the chat surface: attach scene nodes, FileSystem files, or pasted screenshots as context; the agent edits your project in place. No copy-paste between a separate chat app and the editor.
 
+## Requirements
+
+[Node.js](https://nodejs.org) 18+ is required to run the local ACP adapters. Install the adapters you want to use:
+
+```bash
+npm install -g @zed-industries/claude-code-acp @zed-industries/codex-acp
+```
+
+The plugin also falls back to `npx -y <package>` on first run, so global install is optional — it just avoids the one-time download and works offline afterwards.
+
+Each adapter handles its own authentication: [claude-code-acp](https://github.com/zed-industries/claude-code-acp) uses the Claude CLI login, [codex-acp](https://github.com/zed-industries/codex-acp) uses the OpenAI Codex CLI login. Run either CLI once outside Godot to sign in.
+
 ## Credits
 
 Standing on [Zed](https://github.com/zed-industries/zed)'s shoulders — the ACP transport and most of the UX (plan / queue drawers, composer chips, transcript persistence, tool-call rendering) are modeled directly on Zed's external-agent implementation.

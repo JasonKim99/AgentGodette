@@ -20,7 +20,7 @@ const MAX_HEIGHT: int = 520
 # separations + delete button + the StyleBoxEmpty content margins). Used
 # when converting the widest label's text width into the target popup
 # width — bumping one raises the floor on required popup width.
-const ROW_CHROME_PX: int = 74
+const ROW_CHROME_PX: int = 78
 
 var _scroll: ScrollContainer
 var _list: VBoxContainer
@@ -152,7 +152,12 @@ func _build_row(session_index: int, context: Dictionary, delete_icon: Texture2D)
 
 	var agent_icon_cb: Callable = context.get("agent_icon_for", Callable())
 	var icon := TextureRect.new()
-	icon.custom_minimum_size = Vector2(18, 18)
+	# 22 × 22 — the underlying agent icon texture is rasterised at
+	# THREAD_MENU_AGENT_ICON_SIZE (28), so at 22 we display ~80% of the
+	# source bitmap without upscaling. 18 read too small next to the 14 px
+	# label; 22 lines up with the row's visual weight. ROW_CHROME_PX also
+	# reflects this bump so the popup width math stays in sync.
+	icon.custom_minimum_size = Vector2(22, 22)
 	icon.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	icon.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT
 	icon.size_flags_vertical = Control.SIZE_SHRINK_CENTER
