@@ -2,9 +2,9 @@
 
 Cover art inspired by Agent 47.
 
-# Agent Godette
+# Agent Godette&nbsp;&nbsp;<sup>v0.3.1</sup>
 
-v0.3.1
+![License](https://img.shields.io/badge/license-MIT-green) ![Node.js](https://img.shields.io/badge/Node.js-18+-brightgreen?logo=nodedotjs&logoColor=white) ![ACP](https://img.shields.io/badge/protocol-ACP-8b5cf6)
 
 **Per-session model, mode, and reasoning** — switch model, reasoning effort, and permission mode per thread, right from the composer bar.
 
