@@ -172,6 +172,17 @@ func get_entry_control(entry_index: int) -> Control:
 
 
 func _notification(what: int) -> void:
+	if what == NOTIFICATION_VISIBILITY_CHANGED:
+		# Dock plugins' child controls are wrapped in the editor's tab
+		# widget — on first activation the scroll container's size is
+		# still 0 when `set_entries_snapshot` runs, so the initial
+		# `_schedule_materialize` picks an empty visible range and the
+		# feed renders blank until the user scrolls / switches session.
+		# Retrigger materialize whenever visibility flips on, catching
+		# the "tab was hidden, now shown" case.
+		if is_visible_in_tree() and not _entries.is_empty():
+			_schedule_materialize()
+		return
 	if what == NOTIFICATION_RESIZED:
 		# Only width changes invalidate wrap-derived heights. Height-only
 		# resize notifications arrive constantly as our own virtual_height

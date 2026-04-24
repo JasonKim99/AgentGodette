@@ -180,6 +180,11 @@ static func write_thread_cache(session: Dictionary) -> void:
 		"transcript": compact_transcript(session.get("transcript", [])),
 		"attachments": session.get("attachments", []),
 		"managed_attachment_refs": session.get("managed_attachment_refs", []),
+		# Plan state lives on the session dict (not in the transcript)
+		# since it's a drawer above the composer, not a chat bubble.
+		# Persist it so the drawer repopulates across editor restarts —
+		# matches Zed's thread.plan SQLite persistence.
+		"plan_entries": compact_plan_items(session.get("plan_entries", [])),
 	}
 	var file := FileAccess.open(thread_cache_path(session_id), FileAccess.WRITE)
 	if file == null:
@@ -236,12 +241,13 @@ static func hydrate(session: Dictionary) -> void:
 	var cached_transcript_variant = cache.get("transcript", [])
 	var cached_attachments_variant = cache.get("attachments", [])
 	var cached_managed_attachment_refs = cache.get("managed_attachment_refs", [])
+	var cached_plan_entries_variant = cache.get("plan_entries", [])
 	session["transcript"] = cached_transcript_variant if cached_transcript_variant is Array else []
 	session["attachments"] = cached_attachments_variant if cached_attachments_variant is Array else []
 	session["managed_attachment_refs"] = cached_managed_attachment_refs if cached_managed_attachment_refs is Array else []
+	session["plan_entries"] = cached_plan_entries_variant if cached_plan_entries_variant is Array else []
 	session["assistant_entry_index"] = -1
 	session["thought_entry_index"] = -1
-	session["plan_entry_index"] = -1
 	session["tool_calls"] = {}
 	session["hydrated"] = true
 
@@ -255,10 +261,10 @@ static func dehydrate(session: Dictionary) -> void:
 	write_thread_cache(session)
 	session["transcript"] = []
 	session["attachments"] = []
+	session["plan_entries"] = []
 	session["tool_calls"] = {}
 	session["assistant_entry_index"] = -1
 	session["thought_entry_index"] = -1
-	session["plan_entry_index"] = -1
 	session["hydrated"] = false
 
 
@@ -277,9 +283,29 @@ static func restored_session(
 	default_agent_id: String,
 	fallback_number: int,
 ) -> Dictionary:
+	var session_id := str(saved_session.get("id", "session_%d" % fallback_number))
+	# Timestamp priority (highest first):
+	#   1. Explicit field from the persisted index (saved_session)
+	#   2. `FileAccess.get_modified_time` on the thread cache file
+	#      (real filesystem mtime — survives even when the index
+	#      forgot to record a timestamp)
+	#   3. Current time, last resort
+	# This way old sessions that predate the `updated_at` field still
+	# show a real freshness indicator based on when their transcript
+	# cache was last written to disk.
+	var fs_mtime_msec: int = _filesystem_modified_msec(session_id)
+	var default_msec: int = fs_mtime_msec if fs_mtime_msec > 0 else int(Time.get_unix_time_from_system() * 1000.0)
+	var updated_at: int = int(saved_session.get("updated_at", default_msec))
+	if updated_at <= 0:
+		updated_at = default_msec
+	var created_at: int = int(saved_session.get("created_at", updated_at))
+	if created_at <= 0:
+		created_at = updated_at
+
 	return {
-		"id": str(saved_session.get("id", "session_%d" % fallback_number)),
+		"id": session_id,
 		"title": str(saved_session.get("title", "Session")),
+		"derived_title": str(saved_session.get("derived_title", "")),
 		"agent_id": str(saved_session.get("agent_id", default_agent_id)),
 		"remote_session_id": str(saved_session.get("remote_session_id", "")),
 		"remote_session_loaded": false,
@@ -288,9 +314,9 @@ static func restored_session(
 		"attachments": [],
 		"managed_attachment_refs": [],
 		"transcript": [],
+		"plan_entries": [],
 		"assistant_entry_index": -1,
 		"thought_entry_index": -1,
-		"plan_entry_index": -1,
 		"queued_prompts": [],
 		"tool_calls": {},
 		"available_commands": saved_session.get("available_commands", {}),
@@ -302,8 +328,25 @@ static func restored_session(
 		"cancelling": false,
 		"busy": false,
 		"hydrated": false,
-		"updated_at": int(saved_session.get("updated_at", Time.get_ticks_msec()))
+		"updated_at": updated_at,
+		"created_at": created_at,
 	}
+
+
+# Query the thread cache file's mtime as Unix milliseconds.
+# `FileAccess.get_modified_time` returns Unix seconds; we scale up.
+# Returns 0 when the cache file doesn't exist (e.g. brand-new session
+# that hasn't persisted a transcript yet).
+static func _filesystem_modified_msec(session_id: String) -> int:
+	if session_id.is_empty():
+		return 0
+	var path := thread_cache_path(session_id)
+	if not FileAccess.file_exists(path):
+		return 0
+	var mtime_sec: int = FileAccess.get_modified_time(path)
+	if mtime_sec <= 0:
+		return 0
+	return mtime_sec * 1000
 
 
 # Older builds inlined the transcript into the index file. When we see
@@ -350,6 +393,11 @@ static func session_metadata_snapshot(session: Dictionary, default_agent_id: Str
 	return {
 		"id": str(session.get("id", "")),
 		"title": str(session.get("title", "Session")),
+		# `derived_title` is the first-user-message snippet captured
+		# when the session first sends a prompt. Persisted here so the
+		# thread menu can show meaningful labels for inactive
+		# (dehydrated) sessions without re-reading each transcript.
+		"derived_title": str(session.get("derived_title", "")),
 		"agent_id": str(session.get("agent_id", default_agent_id)),
 		"remote_session_id": str(session.get("remote_session_id", "")),
 		"remote_session_loaded": not str(session.get("remote_session_id", "")).is_empty(),
@@ -359,7 +407,8 @@ static func session_metadata_snapshot(session: Dictionary, default_agent_id: Str
 		"config_options": session.get("config_options", []),
 		"current_model_id": str(session.get("current_model_id", "")),
 		"current_mode_id": str(session.get("current_mode_id", "")),
-		"updated_at": int(session.get("updated_at", 0))
+		"updated_at": int(session.get("updated_at", 0)),
+		"created_at": int(session.get("created_at", 0)),
 	}
 
 
@@ -416,9 +465,6 @@ static func compact_transcript(transcript_variant) -> Array:
 		var status: String = str(entry.get("status", ""))
 		if not status.is_empty():
 			compact_entry["status"] = status
-
-		if entry.has("items"):
-			compact_entry["items"] = compact_plan_items(entry.get("items", []))
 
 		# User bubble's inline chip layout. Stored as pure JSON segments
 		# (text runs + chip references). Round-trips as-is so transcripts

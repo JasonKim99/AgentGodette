@@ -17,8 +17,18 @@ const ComposerChipOverlayScript = preload("res://addons/godette_agent/composer_c
 const PASTED_IMAGE_DIR := "res://addons/godette_agent/attachments/"
 const CLAUDE_AGENT_ICON = preload("res://addons/godette_agent/icons/claude.svg")
 const CODEX_CLI_ICON = preload("res://addons/godette_agent/icons/openai.svg")
+# Plan drawer status icons, copied from Zed's asset set
+# (assets/icons/todo_{pending,progress,complete}.svg). Stroked in white so
+# we can tint at render time via TextureRect.modulate.
+const TODO_PENDING_ICON = preload("res://addons/godette_agent/icons/todo_pending.svg")
+const TODO_PROGRESS_ICON = preload("res://addons/godette_agent/icons/todo_progress.svg")
+const TODO_COMPLETE_ICON = preload("res://addons/godette_agent/icons/todo_complete.svg")
 const SEND_ICON = preload("res://addons/godette_agent/icons/send.svg")
 const STOP_ICON = preload("res://addons/godette_agent/icons/stop.svg")
+# Shown on the send button while the agent is busy AND the composer has
+# typed / chip content — pressing enqueues instead of sending. Matches
+# Zed's send → list-end glyph swap.
+const QUEUE_ICON = preload("res://addons/godette_agent/icons/lucide--list-end.svg")
 const ADD_ICON = preload("res://addons/godette_agent/icons/add.svg")
 const HISTORY_ICON = preload("res://addons/godette_agent/icons/history.svg")
 # Tool-kind glyphs for the tool card header — Lucide set, matches the ACP
@@ -52,6 +62,11 @@ const RECENT_SESSION_LIMIT := 6
 # Only the Timer debounce interval is a dock concern (Timer is a Node).
 const SESSION_PERSIST_DEBOUNCE_SEC := 0.4
 const THREAD_MENU_SESSION_ID_OFFSET := 1000
+# "Delete <session>" row IDs live in their own numeric range so the
+# single id_pressed dispatch can tell open-vs-delete apart without a
+# second signal hookup. Using 10000 gives us room for ~9000 sessions
+# in the open range before the two windows collide.
+const THREAD_MENU_DELETE_ID_OFFSET := 10000
 const ADD_MENU_AGENT_ID_OFFSET := 2000
 const AGENTS := [
 	{"id": "claude_agent", "label": "Claude Agent"},
@@ -65,6 +80,19 @@ var thread_switcher_button: Button
 var add_menu: MenuButton
 var message_scroll: ScrollContainer
 var message_stream: GodetteVirtualFeed
+# Plan drawer sits above the composer, between the message feed and the
+# text input — mirrors Zed's layout where the plan collapses / expands in
+# place as a sibling of the composer rather than an inline message. Own
+# node here (instead of a transcript entry) so toggling expand/collapse
+# doesn't reflow the scrollable chat history.
+var plan_drawer: PanelContainer
+var plan_drawer_content: VBoxContainer
+# Queue drawer sits between the plan drawer and the composer frame,
+# matching Zed's stacked composer-drawer layout (plan / edits / queue /
+# composer, top to bottom). Hidden when the queue is empty.
+var queue_drawer: PanelContainer
+var queue_drawer_content: VBoxContainer
+var queue_expanded_sessions: Dictionary = {}
 var prompt_input: TextEdit
 var composer_options_bar: HBoxContainer
 var composer_chip_overlay: GodetteComposerChipOverlay
@@ -72,7 +100,6 @@ var send_button: Button
 # Left-aligned badge in composer_options_bar showing how many follow-up
 # prompts are queued behind the current streaming turn. Hidden when the
 # queue is empty so the bar stays uncluttered in the common case.
-var queue_count_label: Label
 var status_label: Label
 var status_dot: PanelContainer
 var loading_scanner: GodetteLoadingScanner
@@ -472,6 +499,54 @@ func _build_ui() -> void:
 	message_stream.entry_created.connect(Callable(self, "_on_virtual_feed_entry_created"))
 	message_stream.entry_freed.connect(Callable(self, "_on_virtual_feed_entry_freed"))
 
+	# Composer zone = plan drawer + composer frame, stacked with zero
+	# separation so the drawer's flat bottom edge meets the composer's
+	# top without a visible gap. Keeps them reading as one attached unit
+	# (Zed does the same — the plan panel is structurally "attached" to
+	# the composer above by sharing its top rounding with the composer's
+	# top edge). The zone sits directly in the dock VBox, inheriting its
+	# horizontal expand.
+	var composer_zone := VBoxContainer.new()
+	composer_zone.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	composer_zone.add_theme_constant_override("separation", 0)
+	add_child(composer_zone)
+
+	plan_drawer = PanelContainer.new()
+	plan_drawer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	plan_drawer.visible = false
+	plan_drawer.mouse_filter = Control.MOUSE_FILTER_PASS
+	plan_drawer.add_theme_stylebox_override("panel", _plan_drawer_style())
+	composer_zone.add_child(plan_drawer)
+
+	var plan_padding := MarginContainer.new()
+	plan_padding.add_theme_constant_override("margin_left", 10)
+	plan_padding.add_theme_constant_override("margin_right", 8)
+	plan_padding.add_theme_constant_override("margin_top", 6)
+	plan_padding.add_theme_constant_override("margin_bottom", 6)
+	plan_drawer.add_child(plan_padding)
+
+	plan_drawer_content = VBoxContainer.new()
+	plan_drawer_content.add_theme_constant_override("separation", 4)
+	plan_padding.add_child(plan_drawer_content)
+
+	queue_drawer = PanelContainer.new()
+	queue_drawer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	queue_drawer.visible = false
+	queue_drawer.mouse_filter = Control.MOUSE_FILTER_PASS
+	queue_drawer.add_theme_stylebox_override("panel", _queue_drawer_style())
+	composer_zone.add_child(queue_drawer)
+
+	var queue_padding := MarginContainer.new()
+	queue_padding.add_theme_constant_override("margin_left", 10)
+	queue_padding.add_theme_constant_override("margin_right", 8)
+	queue_padding.add_theme_constant_override("margin_top", 6)
+	queue_padding.add_theme_constant_override("margin_bottom", 6)
+	queue_drawer.add_child(queue_padding)
+
+	queue_drawer_content = VBoxContainer.new()
+	queue_drawer_content.add_theme_constant_override("separation", 4)
+	queue_padding.add_child(queue_drawer_content)
+
 	# Composer frame: a single bordered surface that hosts the text input
 	# directly. Attachments appear INLINE as chips drawn by the overlay (a
 	# child of prompt_input) so the old separate chip strip is gone — the
@@ -479,7 +554,7 @@ func _build_ui() -> void:
 	var composer_frame := PanelContainer.new()
 	composer_frame.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	composer_frame.add_theme_stylebox_override("panel", _prompt_input_style(false))
-	add_child(composer_frame)
+	composer_zone.add_child(composer_frame)
 
 	# Use a local typed ref so the `image_pasted` signal connection resolves
 	# through the subclass statically. Assigning the member `prompt_input`
@@ -491,6 +566,11 @@ func _build_ui() -> void:
 	typed_prompt.image_pasted.connect(Callable(self, "_on_composer_image_pasted"))
 	typed_prompt.submit_requested.connect(Callable(self, "_on_composer_submit_requested"))
 	typed_prompt.chips_changed.connect(Callable(self, "_on_composer_chips_changed"))
+	# Content-change hook: send button flips between Send / Queue /
+	# Stop based on whether the composer has any text or chips. Listen
+	# to text_changed on the underlying TextEdit so typing updates the
+	# icon without waiting for a focus / session event.
+	typed_prompt.text_changed.connect(Callable(self, "_refresh_send_state"))
 	prompt_input = typed_prompt
 	prompt_input.custom_minimum_size = Vector2(0, 120)
 	prompt_input.placeholder_text = _prompt_placeholder(DEFAULT_AGENT_ID)
@@ -572,17 +652,12 @@ func _build_ui() -> void:
 	# its width actually changes.
 	composer_options_bar.resized.connect(Callable(self, "_on_composer_bar_resized"))
 
-	# Queue indicator sits on the LEFT of the bar. Gets SIZE_EXPAND_FILL so
-	# it absorbs the horizontal slack that otherwise ALIGNMENT_END would hand
-	# to whitespace — the net visual is queue-text left, send-button right.
-	# Hidden entirely when the queue is empty (see _refresh_queue_indicator).
-	queue_count_label = Label.new()
-	queue_count_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	queue_count_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_LEFT
-	queue_count_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	queue_count_label.modulate = Color(0.90, 0.90, 0.95, 0.70)
-	queue_count_label.visible = false
-	composer_options_bar.add_child(queue_count_label)
+	# Spacer pushes the send button to the right. The old "N queued"
+	# label lived here too; queue state now renders in `queue_drawer`
+	# above the composer (see _refresh_queue_drawer).
+	var options_spacer := Control.new()
+	options_spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	composer_options_bar.add_child(options_spacer)
 
 	send_button = Button.new()
 	send_button.text = ""
@@ -613,16 +688,26 @@ func _make_supporting_label(text: String) -> Label:
 
 
 func _now_tick() -> int:
-	return Time.get_ticks_msec()
+	# Unix milliseconds — what the session list's relative-time
+	# formatting expects. `Time.get_ticks_msec()` used to live here, but
+	# that's engine-start-relative (values like 30_000 for "30 s into
+	# editor session") and collides with the Unix-timestamp convention
+	# every other `updated_at` source uses (remote `updatedAt` parsed
+	# via `_timestamp_msec_from_iso` is already Unix ms).
+	return int(Time.get_unix_time_from_system() * 1000.0)
 
 
 func _touch_session(session_index: int) -> void:
 	if session_index < 0 or session_index >= sessions.size():
 		return
 
+	# Bump the thread cache file's mtime on disk by rewriting it.
+	# The menu label reads `FileAccess.get_modified_time(thread_cache_path)`
+	# directly as the "updated_at" source of truth, so this write IS the
+	# timestamp update — no in-memory field to keep in sync.
 	var session: Dictionary = sessions[session_index]
-	session["updated_at"] = _now_tick()
-	sessions[session_index] = session
+	if bool(session.get("hydrated", false)):
+		SessionStoreScript.write_thread_cache(session)
 
 	if thread_menu != null:
 		_refresh_thread_menu()
@@ -811,13 +896,17 @@ func _most_recent_session_index() -> int:
 	if sessions.is_empty():
 		return -1
 
+	# Sort by the same timestamp the menu shows — filesystem mtime of
+	# the thread cache file, falling back to created_at. Otherwise the
+	# "most recent" notion here can diverge from what's visibly at the
+	# top of the thread menu.
 	var best_index := 0
-	var best_updated_at: int = int(sessions[0].get("updated_at", 0))
+	var best_ts: int = _session_activity_msec(sessions[0])
 	for session_index in range(1, sessions.size()):
-		var candidate_updated_at: int = int(sessions[session_index].get("updated_at", 0))
-		if candidate_updated_at > best_updated_at:
+		var candidate_ts: int = _session_activity_msec(sessions[session_index])
+		if candidate_ts > best_ts:
 			best_index = session_index
-			best_updated_at = candidate_updated_at
+			best_ts = candidate_ts
 	return best_index
 
 
@@ -841,6 +930,12 @@ func _restore_persisted_state() -> bool:
 	next_session_number = int(result.get("next_session_number", sessions.size() + 1))
 	selected_agent_id = str(result.get("selected_agent_id", DEFAULT_AGENT_ID))
 
+	# One-shot migrations. Each one reads / patches the per-session
+	# thread cache files on disk; runs only when there's work to do so
+	# repeated startups are no-ops after the first pass.
+	_purge_legacy_cancellation_system_messages()
+	_backfill_derived_titles()
+
 	var session_index := -1
 	var current_session_id: String = str(result.get("current_session_id", ""))
 	if not current_session_id.is_empty():
@@ -852,6 +947,92 @@ func _restore_persisted_state() -> bool:
 
 	_switch_session(session_index)
 	return true
+
+
+func _purge_legacy_cancellation_system_messages() -> void:
+	# Older versions appended a "<Agent> finished with cancelled." system
+	# message every time the user hit Stop or Send Now. Zed never did
+	# this, and we stopped doing it (see _on_connection_prompt_finished).
+	# Scrub any lingering copies from both the in-memory transcript of
+	# the current hydrated session AND the on-disk cache files for the
+	# rest.
+	for session_index in range(sessions.size()):
+		var session: Dictionary = sessions[session_index]
+		var session_id := str(session.get("id", ""))
+		if session_id.is_empty():
+			continue
+		if bool(session.get("hydrated", false)):
+			var in_memory_variant = session.get("transcript", [])
+			if in_memory_variant is Array:
+				var cleaned_memory := _strip_legacy_cancel_messages(in_memory_variant)
+				if cleaned_memory.size() != (in_memory_variant as Array).size():
+					session["transcript"] = cleaned_memory
+					sessions[session_index] = session
+			continue
+		var cache: Dictionary = SessionStoreScript.read_thread_cache(session_id)
+		if cache.is_empty():
+			continue
+		var transcript_variant = cache.get("transcript", [])
+		if not (transcript_variant is Array):
+			continue
+		var cleaned_disk := _strip_legacy_cancel_messages(transcript_variant)
+		if cleaned_disk.size() == (transcript_variant as Array).size():
+			continue
+		var patched: Dictionary = cache
+		patched["transcript"] = cleaned_disk
+		var path := SessionStoreScript.thread_cache_path(session_id)
+		var file := FileAccess.open(path, FileAccess.WRITE)
+		if file != null:
+			file.store_string(JSON.stringify(patched))
+			file.flush()
+
+
+func _strip_legacy_cancel_messages(transcript: Array) -> Array:
+	var cleaned: Array = []
+	for entry_variant in transcript:
+		if typeof(entry_variant) != TYPE_DICTIONARY:
+			cleaned.append(entry_variant)
+			continue
+		var entry: Dictionary = entry_variant
+		if str(entry.get("speaker", "")) == "System" and " finished with cancelled." in str(entry.get("content", "")):
+			continue
+		cleaned.append(entry)
+	return cleaned
+
+
+func _backfill_derived_titles() -> void:
+	var changed := false
+	for session_index in range(sessions.size()):
+		var session: Dictionary = sessions[session_index]
+		if not str(session.get("derived_title", "")).strip_edges().is_empty():
+			continue
+		# Only peek when the session actually needs the backfill —
+		# i.e. the stored title is a placeholder like "Session 14".
+		# If it already has a real title we have nothing to derive.
+		if not _is_placeholder_title(str(session.get("title", "")).strip_edges()):
+			continue
+		var session_id := str(session.get("id", ""))
+		if session_id.is_empty():
+			continue
+		var cache: Dictionary = SessionStoreScript.read_thread_cache(session_id)
+		var transcript_variant = cache.get("transcript", [])
+		if not (transcript_variant is Array):
+			continue
+		for entry_variant in transcript_variant:
+			if typeof(entry_variant) != TYPE_DICTIONARY:
+				continue
+			var entry: Dictionary = entry_variant
+			if str(entry.get("kind", "")) != "user":
+				continue
+			var snippet := _snippet_from_user_text(str(entry.get("content", "")))
+			if snippet.is_empty():
+				continue
+			session["derived_title"] = snippet
+			sessions[session_index] = session
+			changed = true
+			break
+	if changed:
+		_schedule_persist_state()
 
 
 func _begin_session_discovery() -> void:
@@ -881,17 +1062,20 @@ func _finish_startup_discovery_for_agent(agent_id: String) -> void:
 func _current_thread_title() -> String:
 	if current_session_index < 0 or current_session_index >= sessions.size():
 		return "New Thread"
-	return _safe_text(str(sessions[current_session_index].get("title", "New Thread")))
+	# Use the same derived-from-first-user-message fallback as the
+	# thread menu so the header and the menu don't disagree on what
+	# a session is called.
+	return _safe_text(_session_display_title(sessions[current_session_index]))
 
 
 func _recent_session_indices(limit: int) -> Array:
 	var ordered: Array = []
 	for session_index in range(sessions.size()):
 		var inserted := false
-		var updated_at: int = int(sessions[session_index].get("updated_at", 0))
+		var updated_at: int = _session_activity_msec(sessions[session_index])
 		for ordered_index in range(ordered.size()):
 			var candidate_index: int = int(ordered[ordered_index])
-			var candidate_updated_at: int = int(sessions[candidate_index].get("updated_at", 0))
+			var candidate_updated_at: int = _session_activity_msec(sessions[candidate_index])
 			if updated_at > candidate_updated_at:
 				ordered.insert(ordered_index, session_index)
 				inserted = true
@@ -913,7 +1097,94 @@ func _thread_menu_label(session_index: int) -> String:
 		return "Session"
 
 	var session: Dictionary = sessions[session_index]
-	return _safe_text(str(session.get("title", "Session")))
+	var title := _session_display_title(session)
+	# `updated_at` source of truth = thread cache file's mtime. The
+	# file is rewritten on every _touch_session, so its mtime tracks
+	# real activity. Falls back to the in-memory `created_at` field
+	# when the thread cache doesn't exist yet (brand-new session, no
+	# persisted transcript). Shows "—" only if nothing is available.
+	var ts_msec: int = _session_activity_msec(session)
+	var relative: String = _relative_time_label(ts_msec) if ts_msec > 0 else "—"
+	return _safe_text("%s  ·  %s" % [title, relative])
+
+
+func _session_display_title(session: Dictionary) -> String:
+	# Prefer a title the adapter (or remote session info) set explicitly.
+	# For locally-created sessions whose adapter never emitted a
+	# session_info_update, the stored title is a placeholder like
+	# "Session 14" — substitute the first user message's content so the
+	# menu shows what the conversation is actually about. `derived_title`
+	# is populated on first user-message append and persisted, so it
+	# survives dehydration (menu renders work without having to re-read
+	# each inactive session's transcript off disk).
+	var stored_title := str(session.get("title", "")).strip_edges()
+	if not _is_placeholder_title(stored_title):
+		return stored_title
+	var persisted_derived := str(session.get("derived_title", "")).strip_edges()
+	if not persisted_derived.is_empty():
+		return persisted_derived
+	# Live-transcript fallback for the currently hydrated session when
+	# derived_title hasn't been captured yet (edge case: first-time
+	# upgrade path, very-first-message-in-flight, etc).
+	var derived := _first_user_message_snippet(session)
+	if not derived.is_empty():
+		return derived
+	if stored_title.is_empty():
+		return "Session"
+	return stored_title
+
+
+func _is_placeholder_title(title: String) -> bool:
+	# "Session 14", "Session 2", etc. — the numeric-suffix pattern we
+	# mint in `_create_session` when the adapter hasn't given us a
+	# real title. Treat any such value as "needs replacement".
+	if title.is_empty():
+		return true
+	if not title.begins_with("Session "):
+		return false
+	var suffix := title.substr(8).strip_edges()
+	return suffix.is_valid_int()
+
+
+func _first_user_message_snippet(session: Dictionary) -> String:
+	var transcript_variant = session.get("transcript", [])
+	if not (transcript_variant is Array):
+		return ""
+	for entry_variant in transcript_variant:
+		if typeof(entry_variant) != TYPE_DICTIONARY:
+			continue
+		var entry: Dictionary = entry_variant
+		if str(entry.get("kind", "")) != "user":
+			continue
+		var content := str(entry.get("content", "")).strip_edges()
+		if content.is_empty():
+			continue
+		# First line only, trimmed — multi-line prompts would blow out
+		# the menu row otherwise.
+		var newline_index := content.find("\n")
+		if newline_index >= 0:
+			content = content.substr(0, newline_index).strip_edges()
+		# Cap to a reasonable length so long one-liners still fit in
+		# the menu without clipping.
+		const MAX_SNIPPET_CHARS := 48
+		if content.length() > MAX_SNIPPET_CHARS:
+			content = content.substr(0, MAX_SNIPPET_CHARS).strip_edges() + "…"
+		return content
+	return ""
+
+
+func _session_activity_msec(session: Dictionary) -> int:
+	var session_id := str(session.get("id", ""))
+	if not session_id.is_empty():
+		var path := SessionStoreScript.thread_cache_path(session_id)
+		if FileAccess.file_exists(path):
+			var mtime_sec := FileAccess.get_modified_time(path)
+			if mtime_sec > 0:
+				return mtime_sec * 1000
+	# No cache file on disk — session was created but never persisted
+	# anything (just spawned, never sent a prompt). Fall back to the
+	# explicit created_at we wrote when the session was spawned.
+	return int(session.get("created_at", 0))
 
 
 func _thread_menu_tooltip(session_index: int) -> String:
@@ -922,6 +1193,35 @@ func _thread_menu_tooltip(session_index: int) -> String:
 
 	var session: Dictionary = sessions[session_index]
 	return _safe_text("%s | %s" % [str(session.get("title", "Session")), _agent_label(str(session.get("agent_id", DEFAULT_AGENT_ID)))])
+
+
+# Compact relative time string for session list labels:
+#   <45 s     → "now"
+#   <60 min   → "Xm"
+#   <24 h     → "Xh"
+#   <7 d      → "Xd"
+#   <5 w      → "Xw"
+#   otherwise → absolute date "YYYY-MM-DD"
+# `updated_at` is stored as unix milliseconds (see `_timestamp_msec_from_iso`).
+# Returns empty string for zero / negative values so the caller can fall
+# back to the bare title without dangling separator punctuation.
+func _relative_time_label(updated_at_msec: int) -> String:
+	if updated_at_msec <= 0:
+		return ""
+	var now_msec: int = int(Time.get_unix_time_from_system() * 1000.0)
+	var delta_sec: int = max(0, int((now_msec - updated_at_msec) / 1000))
+	if delta_sec < 45:
+		return "now"
+	if delta_sec < 3600:
+		return "%dm" % int(delta_sec / 60)
+	if delta_sec < 86400:
+		return "%dh" % int(delta_sec / 3600)
+	if delta_sec < 604800:
+		return "%dd" % int(delta_sec / 86400)
+	if delta_sec < 2592000:
+		return "%dw" % int(delta_sec / 604800)
+	var date := Time.get_datetime_dict_from_unix_time(int(updated_at_msec / 1000))
+	return "%04d-%02d-%02d" % [int(date.year), int(date.month), int(date.day)]
 
 
 func _agent_icon_texture(agent_id: String, size: int = HEADER_AGENT_ICON_SIZE) -> Texture2D:
@@ -965,8 +1265,6 @@ func _entry_kind(entry: Dictionary) -> String:
 			return "user"
 		"Tool":
 			return "tool"
-		"Plan":
-			return "plan"
 		"System":
 			return "system"
 		_:
@@ -983,8 +1281,6 @@ func _build_stream_entry(entry: Dictionary, entry_index: int = -1) -> Control:
 		var system_label := _make_supporting_label(str(entry.get("content", "")))
 		system_label.modulate = Color(0.86, 0.86, 0.90, 0.72)
 		return system_label
-	if kind == "plan":
-		return _build_plan_entry(entry)
 	if kind == "thought":
 		return _build_thinking_entry(entry, entry_index)
 	if kind == "user" or kind == "assistant":
@@ -1237,12 +1533,7 @@ func _make_tool_code_card(text: String) -> Control:
 
 	var tb: GodetteTextBlock = TextBlockScript.new()
 	tb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	var mono := SystemFont.new()
-	mono.font_names = PackedStringArray([
-		"Cascadia Mono", "Cascadia Code", "Consolas", "JetBrains Mono",
-		"Fira Code", "SF Mono", "Menlo", "Monaco", "Courier New", "monospace",
-	])
-	tb.set_font(mono)
+	tb.set_font(_editor_font("source", 400, false))
 	tb.set_line_spacing(STREAM_BODY_LINE_SPACING)
 	var fg := _editor_color("font_color", "Editor", Color(0.93, 0.94, 0.98, 0.96))
 	tb.set_color(fg)
@@ -1519,8 +1810,20 @@ func _make_disclosure_chevron(is_open: bool) -> Button:
 	button.focus_mode = Control.FOCUS_NONE
 	button.custom_minimum_size = Vector2(22, 22)
 	button.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
-	button.text = "⌃" if is_open else "⌄"
 	button.tooltip_text = "Collapse" if is_open else "Expand"
+	# Prefer the editor's own tree-disclosure icons so the glyph lines
+	# up with neighbouring Label baselines. Unicode carets (⌃ / ⌄) used
+	# to drift vertically because their metrics don't share the Label
+	# font's x-height. Fall back to the text glyph only when no editor
+	# theme is available.
+	var open_icon := _editor_theme_icon("GuiTreeArrowDown")
+	var closed_icon := _editor_theme_icon("GuiTreeArrowRight")
+	var icon: Texture2D = open_icon if is_open else closed_icon
+	if icon != null:
+		button.icon = icon
+		button.expand_icon = false
+	else:
+		button.text = "⌃" if is_open else "⌄"
 	return button
 
 
@@ -1872,6 +2175,19 @@ func _build_chat_message_entry(entry: Dictionary, kind: String, entry_index: int
 	# the bubble in that case so the chips are still visible.
 	var segments_variant = entry.get("segments", null)
 	var has_segments: bool = segments_variant is Array and (segments_variant as Array).size() > 0
+	# Chip segments specifically: only route through RichTextLabel
+	# (fit_content path) when there's actually a chip to render.
+	# Pure-text segments fall back to TextBlock, which sizes tight.
+	# RichTextLabel's fit_content mis-measures vertical extent when
+	# the control's width isn't resolved before layout — the bubble
+	# ends up occupying dozens of lines of blank space. TextBlock has
+	# no such issue.
+	var has_chip_segments := false
+	if has_segments:
+		for seg_variant in (segments_variant as Array):
+			if typeof(seg_variant) == TYPE_DICTIONARY and str((seg_variant as Dictionary).get("type", "")) == "chip":
+				has_chip_segments = true
+				break
 	if body_text.is_empty() and not has_segments:
 		return Control.new()
 
@@ -1892,16 +2208,23 @@ func _build_chat_message_entry(entry: Dictionary, kind: String, entry_index: int
 		user_wrapper.add_child(panel)
 
 		var padding := MarginContainer.new()
-		padding.add_theme_constant_override("margin_left", 8)
+		# Horizontal breathing room inside the bubble. Zed's `px_2` (8 px)
+		# reads tight for CJK content where glyph ink fills the advance
+		# width edge-to-edge, so we bump to 14 — still visually similar
+		# to Zed on Latin text, noticeably more comfortable for Chinese.
+		padding.add_theme_constant_override("margin_left", 14)
 		padding.add_theme_constant_override("margin_top", 12)
-		padding.add_theme_constant_override("margin_right", 8)
+		padding.add_theme_constant_override("margin_right", 14)
 		padding.add_theme_constant_override("margin_bottom", 12)
 		panel.add_child(padding)
-		# If the sender captured inline chips (`segments`), reproduce Zed's
-		# mention layout: chips flow inline with the text. Older entries
-		# (pre-segments) and plain-text turns fall through to the original
-		# single-TextBlock renderer.
-		if has_segments:
+		# Chips present → RichTextLabel flow (inline bgcolor-pill chips
+		# interleaved with text, matches Zed's mention layout).
+		# Otherwise → plain TextBlock, which sizes tight. The "segments
+		# but no chips" case (serialised pre-send state that happens to
+		# be text-only) takes the TextBlock path too, so the RTL
+		# fit_content bug can't bite a bubble that has no chips to
+		# justify using RTL.
+		if has_chip_segments:
 			padding.add_child(_build_user_bubble_flow(segments_variant as Array))
 		else:
 			padding.add_child(_make_stream_text(body_text, kind))
@@ -2208,8 +2531,6 @@ func _stream_entry_title(entry: Dictionary, kind: String) -> String:
 			return _safe_text(str(entry.get("speaker", _agent_label(_current_agent_id()))))
 		"tool":
 			return _safe_text(str(entry.get("title", "Tool")))
-		"plan":
-			return "Plan"
 		_:
 			return _safe_text(str(entry.get("speaker", "System")))
 
@@ -2295,25 +2616,20 @@ func _markdown_render_context(kind: String) -> Dictionary:
 	if kind == "tool":
 		fg = muted_color
 
-	# SystemFont rather than FontVariation so we get a real bold / italic /
-	# monospace cut from the OS font fallback chain. FontVariation can fake
-	# weight by stretching glyph contours but the result is uglier than the
-	# native cut and doesn't help if the inherited font lacks bold info.
-	var bold := SystemFont.new()
-	bold.font_weight = 700
-	var italic := SystemFont.new()
-	italic.font_italic = true
-	var bold_italic := SystemFont.new()
-	bold_italic.font_weight = 700
-	bold_italic.font_italic = true
-	var mono := SystemFont.new()
-	mono.font_names = PackedStringArray([
-		"Cascadia Mono", "Cascadia Code", "Consolas", "JetBrains Mono",
-		"Fira Code", "SF Mono", "Menlo", "Monaco", "Courier New", "monospace",
-	])
-	var mono_bold := SystemFont.new()
-	mono_bold.font_names = mono.font_names
-	mono_bold.font_weight = 700
+	# Pull bold / italic / mono straight from the editor's own font slots
+	# (EditorFonts: "bold", "italic", "source") so markdown typography
+	# tracks whatever font the user has configured for the editor —
+	# Inter + JetBrains Mono by default, or their custom choice. Godot
+	# 4.6 doesn't ship a dedicated bold_italic or mono_bold slot, so we
+	# degrade gracefully: bold_italic → bold (keeps the weight trait,
+	# loses italic), mono_bold → mono. SystemFont fallbacks only kick
+	# in when running without an editor interface (unlikely in practice
+	# for an editor plugin but defensive).
+	var bold: Font = _editor_font("bold", 700, false)
+	var italic: Font = _editor_font("italic", 400, true)
+	var bold_italic: Font = _editor_font("bold", 700, false)
+	var mono: Font = _editor_font("source", 400, false)
+	var mono_bold: Font = _editor_font("source", 700, false)
 
 	# Code chip background uses the editor's "dark_color_2" / fallback to a
 	# slightly lighter surface than the panel itself so chips read as raised.
@@ -2410,115 +2726,547 @@ func _prompt_input_style(focused: bool) -> StyleBoxFlat:
 	return style
 
 
-func _build_plan_entry(entry: Dictionary) -> Control:
+# Rebuild the plan drawer from the current session's plan state. Called
+# on session switch, plan upsert, expand/collapse, and dismiss. Zero
+# animation — layout flips instantly like Zed's does.
+func _refresh_plan_drawer() -> void:
+	if plan_drawer == null or plan_drawer_content == null:
+		return
+	# Wipe prior content; we rebuild the whole drawer body on each refresh.
+	# Safe because the drawer is small (≤ a handful of rows) and this path
+	# doesn't run during hot streaming.
+	for child in plan_drawer_content.get_children():
+		child.queue_free()
+
+	if current_session_index < 0 or current_session_index >= sessions.size():
+		plan_drawer.visible = false
+		return
+
+	var session: Dictionary = sessions[current_session_index]
+	var plan_entries_variant = session.get("plan_entries", [])
+	var plan_entries: Array = plan_entries_variant if plan_entries_variant is Array else []
 	var session_key: String = _current_session_scope_key()
-	# Dismissed → render a zero-height placeholder so the feed still has a
-	# slot for the entry (keeps indices stable and lets an `_upsert_plan_entry`
-	# un-dismiss cleanly via update_entry) but nothing shows.
-	if bool(plan_dismissed_sessions.get(session_key, false)):
-		return Control.new()
 
+	if plan_entries.is_empty() or bool(plan_dismissed_sessions.get(session_key, false)):
+		plan_drawer.visible = false
+		return
+
+	plan_drawer.visible = true
 	var is_expanded: bool = plan_expanded_sessions.get(session_key, false)
-	var plan_entries: Array = entry.get("entries", [])
+	var all_done: bool = _plan_remaining_count(plan_entries) == 0
 
-	var wrapper := MarginContainer.new()
-	wrapper.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	wrapper.add_theme_constant_override("margin_left", 20)
-	wrapper.add_theme_constant_override("margin_right", 20)
-	wrapper.add_theme_constant_override("margin_top", 6)
-	wrapper.add_theme_constant_override("margin_bottom", 6)
-
-	var panel := PanelContainer.new()
-	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	panel.add_theme_stylebox_override("panel", _stream_panel_style("plan"))
-	wrapper.add_child(panel)
-
-	var padding := MarginContainer.new()
-	padding.add_theme_constant_override("margin_left", 10)
-	padding.add_theme_constant_override("margin_top", 8)
-	padding.add_theme_constant_override("margin_right", 10)
-	padding.add_theme_constant_override("margin_bottom", 8)
-	panel.add_child(padding)
-
-	var content := VBoxContainer.new()
-	content.add_theme_constant_override("separation", 10)
-	padding.add_child(content)
-
+	# Header: chevron (left) | title (flex) | count | × (right). Chevron
+	# stays anchored left across states so it doesn't jump position when
+	# the title text changes length.
 	var header_row := HBoxContainer.new()
-	header_row.add_theme_constant_override("separation", 8)
+	header_row.add_theme_constant_override("separation", 6)
 	header_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	# PASS so wheel events bubble up to the ScrollContainer; the left-click
-	# handler in _on_summary_row_gui_input doesn't care about propagation.
 	header_row.mouse_filter = Control.MOUSE_FILTER_PASS
 	header_row.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
 	header_row.gui_input.connect(Callable(self, "_on_summary_row_gui_input").bind(Callable(self, "_on_plan_summary_pressed").bind(session_key)))
-	content.add_child(header_row)
-
-	# Title + count depend on collapsed/expanded:
-	#   Expanded  → "Plan"              + "5/7"
-	#   Collapsed → "Current: <task>"   + "2 left"   (or just "Plan" when no tasks)
-	var title_label := Label.new()
-	title_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	title_label.modulate = _stream_title_color("plan")
-	# Ellipsis is applied by Label automatically when the text overflows the
-	# available width — important for long "Current: …" rows so the row
-	# doesn't force the feed wider than the viewport.
-	title_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
-	title_label.clip_text = true
-	var count_label := Label.new()
-	count_label.modulate = Color(0.91, 0.91, 0.96, 0.66)
-
-	if is_expanded or plan_entries.is_empty():
-		title_label.text = "Plan"
-		if plan_entries.is_empty():
-			count_label.text = ""
-		else:
-			count_label.text = _plan_progress_label(plan_entries)
-	else:
-		var current_task: String = _plan_current_task_text(plan_entries)
-		if current_task.is_empty():
-			title_label.text = "Plan complete"
-		else:
-			title_label.text = "Current: %s" % current_task
-		var remaining: int = _plan_remaining_count(plan_entries)
-		count_label.text = "%d left" % remaining
-
-	header_row.add_child(title_label)
-	header_row.add_child(count_label)
+	plan_drawer_content.add_child(header_row)
 
 	var chevron := _make_disclosure_chevron(is_expanded)
 	chevron.pressed.connect(Callable(self, "_on_plan_summary_pressed").bind(session_key))
 	header_row.add_child(chevron)
 
-	# × close button. Visually matches the chevron button (same theme path)
-	# and sits to its right so the row reads "title … count ⌄ ×" like Zed.
+	var title_label := Label.new()
+	title_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	title_label.modulate = _editor_color("font_color", "Editor", Color(0.95, 0.95, 1.0, 1.0))
+	title_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	title_label.clip_text = true
+	if is_expanded:
+		title_label.text = "Plan"
+	else:
+		var current_task: String = _plan_current_task_text(plan_entries)
+		title_label.text = ("Current: %s" % current_task) if not current_task.is_empty() else "Plan"
+	header_row.add_child(title_label)
+
+	var count_label := Label.new()
+	count_label.modulate = Color(0.91, 0.91, 0.96, 0.66)
+	if all_done:
+		count_label.text = "All Done"
+	elif is_expanded:
+		count_label.text = _plan_progress_label(plan_entries)
+	else:
+		count_label.text = "%d left" % _plan_remaining_count(plan_entries)
+	header_row.add_child(count_label)
+
 	var close_button := _make_plan_close_button()
 	close_button.pressed.connect(Callable(self, "_on_plan_close_pressed").bind(session_key))
 	header_row.add_child(close_button)
 
 	if not is_expanded:
-		return wrapper
+		return
 
-	var divider := HSeparator.new()
-	content.add_child(divider)
-
-	if plan_entries.is_empty():
-		var empty_label := _make_supporting_label("No planned tasks yet.")
-		empty_label.modulate = Color(0.86, 0.86, 0.92, 0.66)
-		content.add_child(empty_label)
-		return wrapper
-
+	# Expanded body: separator line between header and rows (Zed uses
+	# border_b_1 on the header; an HSeparator here is the equivalent), then
+	# a VBox of task rows.
+	plan_drawer_content.add_child(HSeparator.new())
 	var tasks := VBoxContainer.new()
 	tasks.add_theme_constant_override("separation", 2)
-	content.add_child(tasks)
-
+	plan_drawer_content.add_child(tasks)
 	for plan_entry_variant in plan_entries:
 		if typeof(plan_entry_variant) != TYPE_DICTIONARY:
 			continue
-		var plan_entry: Dictionary = plan_entry_variant
-		tasks.add_child(_build_plan_task_row(plan_entry))
+		tasks.add_child(_build_plan_task_row(plan_entry_variant))
 
-	return wrapper
+
+func _plan_drawer_style() -> StyleBoxFlat:
+	# Colors come straight from the editor theme's named tokens so the
+	# drawer tracks whatever light / dark / custom theme the user has
+	# configured:
+	#   bg     = dark_color_1  (one step below base_color — same surface
+	#                           depth other editor side panels use)
+	#   border = contrast_color_1  (default border tint in dark themes)
+	# Top-only rounding + no bottom border so the drawer meets the
+	# composer's top edge seamlessly (Zed's rounded_t_md + border_b_0
+	# pattern).
+	var style := StyleBoxFlat.new()
+	var base := _editor_color("base_color", "Editor", Color(0.16, 0.17, 0.19, 1.0))
+	style.bg_color = _editor_color("dark_color_1", "Editor", base.darkened(0.04))
+	style.corner_radius_top_left = 6
+	style.corner_radius_top_right = 6
+	style.corner_radius_bottom_left = 0
+	style.corner_radius_bottom_right = 0
+	style.border_width_left = 1
+	style.border_width_top = 1
+	style.border_width_right = 1
+	style.border_width_bottom = 0
+	style.border_color = _editor_color("contrast_color_1", "Editor", base.lightened(0.12))
+	return style
+
+
+# Queue drawer ——————————————————————————————————————————————————————————
+#
+# Mirrors Zed's queued-messages UI (thread_view.rs:2708-2753 summary,
+# 3382-3560 per-entry rows). Sits directly above the composer frame,
+# below the plan drawer when both are visible. Header shows the
+# pending count + a "Clear All" shortcut; expanded body renders each
+# queued prompt with edit / send-now / delete controls.
+func _refresh_queue_drawer() -> void:
+	if queue_drawer == null or queue_drawer_content == null:
+		return
+	for child in queue_drawer_content.get_children():
+		child.queue_free()
+
+	if current_session_index < 0 or current_session_index >= sessions.size():
+		queue_drawer.visible = false
+		return
+
+	var session: Dictionary = sessions[current_session_index]
+	var queue_variant = session.get("queued_prompts", [])
+	var queue: Array = queue_variant if queue_variant is Array else []
+	if queue.is_empty():
+		queue_drawer.visible = false
+		return
+
+	queue_drawer.visible = true
+	var session_key: String = _current_session_scope_key()
+	# Default expanded (matches Zed). `queue_expanded_sessions`
+	# holds the user's explicit preference — if they've never toggled
+	# the drawer for this session, show it open so the queue contents
+	# are visible at a glance; once they collapse it, remember that
+	# choice for the session.
+	var is_expanded: bool = queue_expanded_sessions.get(session_key, true)
+
+	var header_row := HBoxContainer.new()
+	header_row.add_theme_constant_override("separation", 6)
+	header_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	header_row.mouse_filter = Control.MOUSE_FILTER_PASS
+	header_row.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
+	header_row.gui_input.connect(Callable(self, "_on_summary_row_gui_input").bind(Callable(self, "_on_queue_summary_pressed").bind(session_key)))
+	queue_drawer_content.add_child(header_row)
+
+	var chevron := _make_disclosure_chevron(is_expanded)
+	chevron.pressed.connect(Callable(self, "_on_queue_summary_pressed").bind(session_key))
+	header_row.add_child(chevron)
+
+	var title_label := Label.new()
+	title_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	title_label.modulate = _editor_color("font_color", "Editor", Color(0.95, 0.95, 1.0, 1.0))
+	title_label.text = "%d Queued Message%s" % [queue.size(), "" if queue.size() == 1 else "s"]
+	title_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	title_label.clip_text = true
+	header_row.add_child(title_label)
+
+	var clear_all := Button.new()
+	clear_all.flat = true
+	clear_all.focus_mode = Control.FOCUS_NONE
+	clear_all.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
+	clear_all.text = "Clear All"
+	clear_all.tooltip_text = "Drop every queued prompt"
+	clear_all.modulate = Color(1.0, 1.0, 1.0, 0.75)
+	clear_all.pressed.connect(Callable(self, "_on_queue_clear_all_pressed"))
+	header_row.add_child(clear_all)
+
+	if not is_expanded:
+		return
+
+	queue_drawer_content.add_child(HSeparator.new())
+	var entries_vbox := VBoxContainer.new()
+	entries_vbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	entries_vbox.add_theme_constant_override("separation", 2)
+	queue_drawer_content.add_child(entries_vbox)
+
+	for i in range(queue.size()):
+		var entry_variant = queue[i]
+		if typeof(entry_variant) != TYPE_DICTIONARY:
+			continue
+		entries_vbox.add_child(_build_queue_entry_row(entry_variant, i))
+		# Zed adds a bottom border between queue rows (not after the
+		# last). HSeparator is the Godot-native way to draw that line
+		# — it inherits the editor theme's separator color automatically.
+		if i < queue.size() - 1:
+			entries_vbox.add_child(HSeparator.new())
+
+
+func _build_queue_entry_row(entry: Dictionary, index: int) -> Control:
+	var is_next: bool = index == 0
+
+	var row := HBoxContainer.new()
+	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_theme_constant_override("separation", 4)  # gap_1 equivalent
+	row.mouse_filter = Control.MOUSE_FILTER_PASS
+
+	# Circle dot — Color::Accent for head-of-queue, Color::Muted for
+	# the rest. Zed puts "Next in Queue" / "In Queue" in the dot's
+	# tooltip rather than a visible inline label.
+	var dot := PanelContainer.new()
+	dot.custom_minimum_size = Vector2(10, 10)
+	dot.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	dot.add_theme_stylebox_override("panel", _queue_dot_style(is_next))
+	dot.tooltip_text = "Next in Queue" if is_next else "In Queue"
+	row.add_child(dot)
+
+	var preview_label := Label.new()
+	preview_label.text = _queue_entry_preview(entry)
+	preview_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	preview_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	preview_label.clip_text = true
+	preview_label.modulate = _editor_color("font_color", "Editor", Color(0.95, 0.95, 1.0, 1.0)) if is_next else Color(1.0, 1.0, 1.0, 0.72)
+	row.add_child(preview_label)
+
+	# Action triplet on the right — Zed order (thread_view.rs:3480-3555):
+	# Trash (IconButton) → Pencil (IconButton) → Send Now (text button).
+	# The first entry shows everything by default; other entries hide
+	# the group until the row is hovered.
+	var delete_button := _make_queue_icon_button("Remove Message from Queue", _editor_theme_icon("Remove"))
+	delete_button.pressed.connect(Callable(self, "_on_queue_delete_pressed").bind(index))
+	row.add_child(delete_button)
+
+	var edit_button := _make_queue_icon_button("Edit", _editor_theme_icon("Edit"))
+	edit_button.pressed.connect(Callable(self, "_on_queue_edit_pressed").bind(index))
+	row.add_child(edit_button)
+
+	var send_now_button := _make_queue_send_now_button(is_next)
+	send_now_button.pressed.connect(Callable(self, "_on_queue_send_now_pressed").bind(index))
+	row.add_child(send_now_button)
+
+	if not is_next:
+		_wire_hover_only_visibility(row, [delete_button, edit_button, send_now_button])
+
+	return row
+
+
+func _make_queue_icon_button(tooltip: String, icon: Texture2D) -> Button:
+	var button := Button.new()
+	button.flat = true
+	button.focus_mode = Control.FOCUS_NONE
+	button.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
+	button.tooltip_text = tooltip
+	button.custom_minimum_size = Vector2(18, 18)
+	if icon != null:
+		button.icon = icon
+		button.expand_icon = false
+	else:
+		button.text = tooltip.substr(0, 1)
+	return button
+
+
+func _make_queue_send_now_button(is_next: bool) -> Button:
+	# Zed renders "Send Now" as a text button (not an icon). The
+	# head-of-queue row gets an Outlined variant so it reads as the
+	# primary affordance; subsequent rows use the default flat look
+	# so they're visible-but-secondary when the user hovers.
+	var button := Button.new()
+	button.focus_mode = Control.FOCUS_NONE
+	button.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
+	button.text = "Send Now"
+	button.tooltip_text = "Send this queued message immediately"
+	if is_next:
+		# Outlined — accent border, transparent bg, so it stands out
+		# against the drawer surface.
+		button.add_theme_stylebox_override("normal", _queue_send_now_outlined_style(false))
+		button.add_theme_stylebox_override("hover", _queue_send_now_outlined_style(true))
+		button.add_theme_stylebox_override("pressed", _queue_send_now_outlined_style(true))
+		button.add_theme_stylebox_override("focus", _queue_send_now_outlined_style(false))
+	else:
+		button.flat = true
+	return button
+
+
+func _queue_send_now_outlined_style(emphasized: bool) -> StyleBoxFlat:
+	var style := StyleBoxFlat.new()
+	style.bg_color = Color(0, 0, 0, 0) if not emphasized else _editor_color("accent_color", "Editor", Color(0.55, 0.78, 1.0, 1.0)).darkened(0.6)
+	var accent := _editor_color("accent_color", "Editor", Color(0.55, 0.78, 1.0, 1.0))
+	style.border_width_left = 1
+	style.border_width_top = 1
+	style.border_width_right = 1
+	style.border_width_bottom = 1
+	style.border_color = accent
+	style.corner_radius_top_left = 4
+	style.corner_radius_top_right = 4
+	style.corner_radius_bottom_left = 4
+	style.corner_radius_bottom_right = 4
+	style.content_margin_left = 8
+	style.content_margin_right = 8
+	style.content_margin_top = 2
+	style.content_margin_bottom = 2
+	return style
+
+
+func _queue_entry_preview(entry: Dictionary) -> String:
+	# Prefer the display_text we captured on enqueue; fall back to
+	# scraping text blocks for older queue entries (defensive — if
+	# anything upstream forgot to fill display_text, we still render
+	# something).
+	var text_variant = entry.get("display_text", "")
+	var text := str(text_variant).strip_edges()
+	if text.is_empty():
+		var blocks_variant = entry.get("blocks", [])
+		if blocks_variant is Array:
+			for block_variant in blocks_variant:
+				if typeof(block_variant) != TYPE_DICTIONARY:
+					continue
+				var block: Dictionary = block_variant
+				if str(block.get("type", "")) == "text":
+					text = str(block.get("text", "")).strip_edges()
+					if not text.is_empty():
+						break
+	if text.is_empty():
+		var attachments_variant = entry.get("attachments", [])
+		if attachments_variant is Array and (attachments_variant as Array).size() > 0:
+			text = "%d attachment%s" % [
+				(attachments_variant as Array).size(),
+				"" if (attachments_variant as Array).size() == 1 else "s",
+			]
+	if text.is_empty():
+		return "(empty prompt)"
+	# Collapse newlines to a single space so the row stays compact.
+	return text.replace("\n", " ").replace("\r", "")
+
+
+func _queue_drawer_style() -> StyleBoxFlat:
+	# Same visual family as the plan drawer — top-rounded, bordered
+	# except on the bottom, editor dark_color_1 surface. When both
+	# drawers are visible they stack cleanly into one continuous
+	# "composer tray" without a gap or a colour shift.
+	var style := StyleBoxFlat.new()
+	var base := _editor_color("base_color", "Editor", Color(0.16, 0.17, 0.19, 1.0))
+	style.bg_color = _editor_color("dark_color_1", "Editor", base.darkened(0.04))
+	style.corner_radius_top_left = 6
+	style.corner_radius_top_right = 6
+	style.corner_radius_bottom_left = 0
+	style.corner_radius_bottom_right = 0
+	style.border_width_left = 1
+	style.border_width_top = 1
+	style.border_width_right = 1
+	style.border_width_bottom = 0
+	style.border_color = _editor_color("contrast_color_1", "Editor", base.lightened(0.12))
+	return style
+
+
+func _queue_dot_style(is_next: bool) -> StyleBoxFlat:
+	var style := StyleBoxFlat.new()
+	var fill: Color
+	if is_next:
+		fill = _editor_color("accent_color", "Editor", Color(0.55, 0.78, 1.0, 1.0))
+	else:
+		fill = _editor_color("font_readonly_color", "Editor", Color(0.78, 0.79, 0.84, 0.55))
+	style.bg_color = fill
+	style.corner_radius_top_left = 99
+	style.corner_radius_top_right = 99
+	style.corner_radius_bottom_right = 99
+	style.corner_radius_bottom_left = 99
+	return style
+
+
+func _on_queue_summary_pressed(session_key: String) -> void:
+	if session_key.is_empty():
+		return
+	# Default is expanded, so the toggle stores the explicit choice
+	# (false = user collapsed; true = user re-opened). Never erase the
+	# key — we want the collapsed state to stick across _refresh
+	# rebuilds, otherwise the default-expanded would snap back open on
+	# every queue mutation.
+	var is_currently_expanded: bool = queue_expanded_sessions.get(session_key, true)
+	queue_expanded_sessions[session_key] = not is_currently_expanded
+	if session_key == _current_session_scope_key():
+		_refresh_queue_drawer()
+
+
+func _on_queue_clear_all_pressed() -> void:
+	if current_session_index < 0 or current_session_index >= sessions.size():
+		return
+	var session: Dictionary = sessions[current_session_index]
+	session["queued_prompts"] = []
+	sessions[current_session_index] = session
+	_refresh_queue_drawer()
+	_refresh_queue_indicator()
+
+
+func _on_queue_delete_pressed(index: int) -> void:
+	if current_session_index < 0 or current_session_index >= sessions.size():
+		return
+	var session: Dictionary = sessions[current_session_index]
+	var queue_variant = session.get("queued_prompts", [])
+	if not (queue_variant is Array):
+		return
+	var queue: Array = queue_variant
+	if index < 0 or index >= queue.size():
+		return
+	queue.remove_at(index)
+	session["queued_prompts"] = queue
+	sessions[current_session_index] = session
+	_refresh_queue_drawer()
+	_refresh_queue_indicator()
+
+
+func _on_queue_send_now_pressed(index: int) -> void:
+	# Zed semantics: Send Now fires the targeted queued message
+	# immediately — interrupts the current turn if one's in flight,
+	# jumps the target to position 0 if it wasn't already, and
+	# dispatches. `_cancel_current_turn` triggers prompt_finished,
+	# which in turn calls `_dispatch_next_prompt` — so we don't have
+	# to re-dispatch here when busy.
+	if current_session_index < 0 or current_session_index >= sessions.size():
+		return
+	var session: Dictionary = sessions[current_session_index]
+	var queue_variant = session.get("queued_prompts", [])
+	if not (queue_variant is Array):
+		return
+	var queue: Array = queue_variant
+	if index < 0 or index >= queue.size():
+		return
+	# Move the target to the head of the queue if it wasn't already.
+	# Re-persist so the reorder survives an editor crash before the
+	# message fires.
+	if index > 0:
+		var entry = queue[index]
+		queue.remove_at(index)
+		queue.insert(0, entry)
+		session["queued_prompts"] = queue
+		sessions[current_session_index] = session
+	_refresh_queue_drawer()
+	_refresh_queue_indicator()
+	if bool(session.get("busy", false)):
+		# Cancel the in-flight turn; prompt_finished will pop the
+		# queue head (now our target) and send it.
+		_cancel_current_turn(current_session_index)
+	else:
+		# Idle — dispatch directly.
+		_dispatch_next_prompt(current_session_index)
+
+
+func _on_queue_edit_pressed(index: int) -> void:
+	# Pull the entry out of the queue and restore the composer to its
+	# state at enqueue time: text, inline chips, attachment list. Anything
+	# the user was currently typing gets dropped — same Zed behaviour
+	# (edit pulls the queued message INTO the main editor, replacing
+	# whatever was there).
+	if current_session_index < 0 or current_session_index >= sessions.size():
+		return
+	var session: Dictionary = sessions[current_session_index]
+	var queue_variant = session.get("queued_prompts", [])
+	if not (queue_variant is Array):
+		return
+	var queue: Array = queue_variant
+	if index < 0 or index >= queue.size():
+		return
+	var entry_variant = queue[index]
+	if typeof(entry_variant) != TYPE_DICTIONARY:
+		return
+	var entry: Dictionary = entry_variant
+	queue.remove_at(index)
+	session["queued_prompts"] = queue
+	# Restore attachments to session.attachments (for the chip overlay +
+	# the next _send_prompt) before poking the composer, so the
+	# composer's chip layer has the metadata it needs to reconstruct
+	# chips on restore.
+	var restored_attachments_variant = entry.get("attachments", [])
+	var restored_attachments: Array = restored_attachments_variant.duplicate(true) if restored_attachments_variant is Array else []
+	session["attachments"] = restored_attachments
+	sessions[current_session_index] = session
+	# Composer text + chips: build a draft dict shaped like
+	# GodetteComposerPromptInput.serialize_draft's output so we can
+	# reuse its restore_draft path unchanged.
+	var inline_prompt := prompt_input as GodetteComposerPromptInput
+	if inline_prompt != null:
+		inline_prompt.clear_all()
+		var display_text := str(entry.get("display_text", ""))
+		var segments_variant = entry.get("segments", [])
+		var segments: Array = segments_variant if segments_variant is Array else []
+		_restore_composer_from_queue_entry(inline_prompt, display_text, segments, restored_attachments)
+	_refresh_composer_context()
+	_refresh_queue_drawer()
+	_refresh_queue_indicator()
+
+
+func _restore_composer_from_queue_entry(
+	inline_prompt: GodetteComposerPromptInput,
+	display_text: String,
+	segments: Array,
+	attachments: Array,
+) -> void:
+	# Walk the segment stream and replay it into the composer: text
+	# segments go in verbatim, chip segments become insert_chip calls.
+	# Attachments have already been restored to session.attachments
+	# above, so insert_chip's underlying metadata lookup succeeds.
+	var metadata_lookup: Dictionary = {}
+	for attachment_variant in attachments:
+		if typeof(attachment_variant) != TYPE_DICTIONARY:
+			continue
+		var attachment: Dictionary = attachment_variant
+		var key := str(attachment.get("key", ""))
+		if key.is_empty():
+			continue
+		metadata_lookup[key] = {
+			"kind": str(attachment.get("kind", "")),
+			"label": ComposerContextScript.display_label_for_attachment(attachment),
+			"tooltip": ComposerContextScript.tooltip_for_attachment(attachment),
+			"icon": _attachment_icon(attachment),
+			"payload": _chip_payload_for_attachment(attachment),
+		}
+
+	if segments.is_empty():
+		# No chip metadata available — restore as plain text.
+		inline_prompt.text = display_text
+		return
+
+	for seg_variant in segments:
+		if typeof(seg_variant) != TYPE_DICTIONARY:
+			continue
+		var seg: Dictionary = seg_variant
+		var seg_type := str(seg.get("type", ""))
+		if seg_type == "text":
+			inline_prompt.insert_text_at_caret(str(seg.get("text", "")))
+		elif seg_type == "chip":
+			var key := str(seg.get("key", ""))
+			if key.is_empty():
+				continue
+			var meta_variant = metadata_lookup.get(key, null)
+			if typeof(meta_variant) != TYPE_DICTIONARY:
+				continue
+			var meta: Dictionary = meta_variant
+			inline_prompt.insert_chip(
+				key,
+				str(meta.get("kind", "")),
+				str(meta.get("label", "")),
+				meta.get("icon", null),
+				str(meta.get("tooltip", "")),
+				meta.get("payload", {}),
+			)
 
 
 func _on_summary_row_gui_input(event: InputEvent, on_press: Callable) -> void:
@@ -2537,34 +3285,24 @@ func _on_plan_summary_pressed(session_key: String) -> void:
 		plan_expanded_sessions.erase(session_key)
 	else:
 		plan_expanded_sessions[session_key] = true
+	if session_key == _current_session_scope_key():
+		_refresh_plan_drawer()
 
-	_rebuild_plan_entry_for_session_key(session_key)
 
-
-func _on_plan_close_pressed(session_key: String) -> void:
-	# Hide the plan panel for this session until the agent writes the plan
-	# again. We don't touch the transcript entry itself — the dismissal is a
-	# UI-only decision. `_upsert_plan_entry` clears the flag on the next
-	# update so a fresh plan surfaces immediately.
-	if session_key.is_empty():
+func _on_plan_close_pressed(_session_key: String) -> void:
+	# × actually clears the plan entries on the current session (not
+	# just a UI-only dismissal). The old in-memory dismissal flag was
+	# lost on editor reload, so a persisted plan came back every time.
+	# Clearing matches the user's intent — "this plan is done, get it
+	# out of here" — and the next _upsert_plan_entry (agent writes a
+	# fresh TodoWrite) surfaces the drawer again with new content.
+	if current_session_index < 0 or current_session_index >= sessions.size():
 		return
-	plan_dismissed_sessions[session_key] = true
-	_rebuild_plan_entry_for_session_key(session_key)
-
-
-func _rebuild_plan_entry_for_session_key(session_key: String) -> void:
-	# Only one plan entry per active session; patch in place if the session
-	# is the current foreground one, otherwise the next feed refresh picks
-	# up the new state.
-	if session_key != _current_session_scope_key():
-		return
-	if current_session_index >= 0 and current_session_index < sessions.size():
-		var session: Dictionary = sessions[current_session_index]
-		var plan_index: int = int(session.get("plan_entry_index", -1))
-		if plan_index >= 0:
-			_update_entry_in_feed(plan_index)
-			return
-	_refresh_chat_log()
+	var session: Dictionary = sessions[current_session_index]
+	session["plan_entries"] = []
+	sessions[current_session_index] = session
+	_touch_session(current_session_index)
+	_refresh_plan_drawer()
 
 
 func _make_plan_close_button() -> Button:
@@ -2595,71 +3333,156 @@ func _current_session_scope_key() -> String:
 func _build_plan_task_row(plan_entry: Dictionary) -> Control:
 	var status: String = str(plan_entry.get("status", "pending"))
 	var is_completed: bool = status == "completed"
+	var is_in_progress: bool = status == "in_progress"
 
 	var row := HBoxContainer.new()
 	row.alignment = BoxContainer.ALIGNMENT_BEGIN
 	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	row.add_theme_constant_override("separation", 10)
+	row.add_theme_constant_override("separation", 8)
 
-	var status_dot_panel := PanelContainer.new()
-	status_dot_panel.custom_minimum_size = Vector2(12, 12)
-	status_dot_panel.add_theme_stylebox_override("panel", _plan_status_style(status))
-	row.add_child(status_dot_panel)
+	# Status indicator: editor theme icon when available (matches Zed's
+	# TodoPending / TodoProgress / TodoComplete set), falling back to the
+	# colored dot when the theme doesn't ship a suitable glyph. In-progress
+	# gets a gentle continuous rotation so it reads as "active" at a
+	# glance.
+	var status_node := _build_plan_status_indicator(status)
+	row.add_child(status_node)
+	if is_in_progress:
+		_attach_rotation_tween(status_node)
 
-	var task_body := VBoxContainer.new()
-	task_body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	task_body.add_theme_constant_override("separation", 2)
-	row.add_child(task_body)
-
-	# PlanTaskLabel draws its own strike line via _draw when struck=true.
-	# Plain Label has no strike-through in Godot's theme system and a
-	# RichTextLabel is off the table (see the rendering-stack note), so we
-	# subclass Label locally. The fade-to-60% on completed rows is the
-	# secondary "done" cue, matching Zed's panel.
-	var task_label := PlanTaskLabel.new()
-	task_label.text = _safe_text(str(plan_entry.get("content", "")))
-	task_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	# RichTextLabel + [s] BBCode: strike is drawn by TextServer
+	# against the actual glyph run, not our hand-rolled measurement,
+	# so endpoints land exactly at text edges regardless of font
+	# side bearing. The Plan drawer sits outside the VirtualFeed
+	# (the "no RTL in the message feed" rule applies to assistant /
+	# user transcript rendering), so it's safe to use here.
+	var task_label := RichTextLabel.new()
+	task_label.bbcode_enabled = true
+	task_label.fit_content = true
+	task_label.scroll_active = false
+	task_label.selection_enabled = false
+	task_label.autowrap_mode = TextServer.AUTOWRAP_OFF
 	task_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	if is_completed:
-		task_label.struck = true
-		task_label.modulate = Color(1.0, 1.0, 1.0, 0.6)
-	task_body.add_child(task_label)
+	task_label.clip_contents = true
 
-	var meta_text: String = _plan_meta_text(plan_entry)
-	if not meta_text.is_empty():
-		var meta_label := Label.new()
-		meta_label.text = _safe_text(meta_text)
-		meta_label.modulate = Color(0.85, 0.85, 0.90, 0.58)
-		meta_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		meta_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		task_body.add_child(meta_label)
+	var raw_content := _safe_text(str(plan_entry.get("content", "")))
+	# Escape `[` so user-typed brackets don't get parsed as BBCode
+	# tags. `]` alone isn't a tag opener, so it stays literal.
+	var escaped := raw_content.replace("[", "[lb]")
+	if is_completed:
+		# Strike + dim via BBCode — `[s]` draws the strikethrough at
+		# the font's underline metrics; `[color]` with alpha gives
+		# the completed-task fade that the old Label used modulate
+		# for.
+		task_label.text = "[s][color=#ffffff8c]%s[/color][/s]" % escaped
+	else:
+		task_label.text = escaped
+
+	row.add_child(task_label)
 
 	return row
 
 
-func _plan_status_style(status: String) -> StyleBoxFlat:
-	var style := StyleBoxFlat.new()
-	style.corner_radius_top_left = 99
-	style.corner_radius_top_right = 99
-	style.corner_radius_bottom_right = 99
-	style.corner_radius_bottom_left = 99
-	style.border_width_left = 1
-	style.border_width_top = 1
-	style.border_width_right = 1
-	style.border_width_bottom = 1
-
+func _build_plan_status_indicator(status: String) -> Control:
+	# Mirrors Zed's Plan panel icons one-to-one: same SVG shapes
+	# (dashed ring for pending, dashed ring + center dot for
+	# in_progress, solid ring + check for completed), colored via
+	# editor theme tokens. The in_progress glyph spins via a Tween
+	# on `rotation` — Zed does the same with a 2 s rotation
+	# animation.
+	var icon: Texture2D
+	var color: Color
 	match status:
 		"completed":
-			style.bg_color = Color(0.34, 0.82, 0.47, 0.98)
-			style.border_color = Color(0.34, 0.82, 0.47, 0.98)
+			icon = TODO_COMPLETE_ICON
+			color = _editor_color("success_color", "Editor", Color(0.34, 0.82, 0.47, 1.0))
 		"in_progress":
-			style.bg_color = Color(0.52, 0.69, 0.98, 0.95)
-			style.border_color = Color(0.52, 0.69, 0.98, 0.95)
+			icon = TODO_PROGRESS_ICON
+			color = _editor_color("accent_color", "Editor", Color(0.55, 0.78, 1.0, 1.0))
 		_:
-			style.bg_color = Color(0, 0, 0, 0)
-			style.border_color = Color(0.78, 0.79, 0.84, 0.52)
+			icon = TODO_PENDING_ICON
+			color = _editor_color("font_readonly_color", "Editor", Color(0.85, 0.85, 0.90, 0.55))
 
-	return style
+	# 14 px at 1.0 UI scale (same as Zed's `IconSize::Small`). Multiply
+	# by EditorInterface's display scale so the glyph keeps pace with
+	# the editor's font size — on a 150 % DPI setup we render at
+	# 21 px, matching the Label font's visual weight instead of
+	# shrinking into a tiny dot beside big text.
+	var scale := 1.0
+	if editor_interface != null:
+		scale = editor_interface.get_editor_scale()
+	var icon_px: float = 14.0 * scale
+	var rect := TextureRect.new()
+	rect.texture = icon
+	rect.custom_minimum_size = Vector2(icon_px, icon_px)
+	rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	rect.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	rect.modulate = color
+	rect.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	return rect
+
+
+func _editor_theme_icon(icon_name: String) -> Texture2D:
+	if editor_interface == null:
+		return null
+	var theme: Theme = editor_interface.get_editor_theme()
+	if theme == null:
+		return null
+	if theme.has_icon(icon_name, "EditorIcons"):
+		return theme.get_icon(icon_name, "EditorIcons")
+	return null
+
+
+# Return the editor theme's font at the given slot (EditorFonts type).
+# Slots used: "main", "bold", "italic", "source". Falls back to
+# SystemFont with `weight` + `italic` trait hints when the editor theme
+# is unavailable — keeps the plugin from crashing in standalone runs.
+# The SystemFont fallback mirrors the editor's defaults (Inter for
+# main/bold/italic, JetBrains Mono for source) via its font_names list.
+func _editor_font(slot: String, fallback_weight: int, fallback_italic: bool) -> Font:
+	if editor_interface != null:
+		var theme: Theme = editor_interface.get_editor_theme()
+		if theme != null and theme.has_font(slot, "EditorFonts"):
+			return theme.get_font(slot, "EditorFonts")
+	var sys := SystemFont.new()
+	if slot == "source":
+		sys.font_names = PackedStringArray([
+			"JetBrains Mono", "Cascadia Mono", "Cascadia Code", "Consolas",
+			"Fira Code", "SF Mono", "Menlo", "Monaco", "Courier New", "monospace",
+		])
+	else:
+		sys.font_names = PackedStringArray([
+			"Inter", "Segoe UI", "SF Pro Text", "Noto Sans", "Arial", "sans-serif",
+		])
+	sys.font_weight = fallback_weight
+	sys.font_italic = fallback_italic
+	return sys
+
+
+func _attach_rotation_tween(node: Control) -> void:
+	# Spin the TextureRect to match Zed's TodoProgress behaviour
+	# (2 s per revolution, infinite loop). Deferred so the node is
+	# inside the tree and its size is resolved before we compute
+	# pivot_offset — otherwise the first frames rotate around (0, 0)
+	# and the glyph drifts off its slot.
+	call_deferred("_start_plan_rotation_for", node)
+
+
+func _start_plan_rotation_for(node: Control) -> void:
+	if node == null or not is_instance_valid(node):
+		return
+	if not node.is_inside_tree():
+		return
+	var pivot: Vector2 = node.size * 0.5
+	if pivot == Vector2.ZERO:
+		pivot = node.custom_minimum_size * 0.5
+	node.pivot_offset = pivot
+	node.rotation = 0.0
+	var tween := node.create_tween().set_loops()
+	# `.from(0.0)` resets the start of each loop — without it the
+	# second revolution would tween "from TAU to TAU" (no motion)
+	# because the previous loop left `rotation` at its end value.
+	tween.tween_property(node, "rotation", TAU, 2.0).from(0.0)
 
 
 func _plan_progress_label(entries: Array) -> String:
@@ -2707,19 +3530,6 @@ func _plan_current_task_text(entries: Array) -> String:
 	return first_pending
 
 
-func _plan_meta_text(plan_entry: Dictionary) -> String:
-	var parts: Array = []
-	var status: String = str(plan_entry.get("status", "pending"))
-	var priority: String = str(plan_entry.get("priority", ""))
-
-	if not status.is_empty():
-		parts.append(_humanize_identifier(status))
-	if not priority.is_empty():
-		parts.append("%s priority" % _humanize_identifier(priority).to_lower())
-
-	return " | ".join(parts)
-
-
 func _stream_panel_style(kind: String) -> StyleBoxFlat:
 	# All card backgrounds derive from the editor's "base_color". Per-kind
 	# tweaks are small offsets so the feed reads as "subtly banded" rather
@@ -2733,8 +3543,6 @@ func _stream_panel_style(kind: String) -> StyleBoxFlat:
 			background = base.lightened(0.02)
 		"tool":
 			background = base.darkened(0.06)
-		"plan":
-			background = base
 		_:
 			background = base
 
@@ -2763,8 +3571,6 @@ func _stream_title_color(kind: String) -> Color:
 		"assistant":
 			return base
 		"tool":
-			return muted
-		"plan":
 			return muted
 		_:
 			return muted
@@ -2813,7 +3619,18 @@ func _send_prompt() -> void:
 	# while busy, so calling it unconditionally is safe.
 	var blocks: Array = _build_prompt_blocks(prompt, attachments)
 	var queue: Array = session.get("queued_prompts", [])
-	queue.append({"blocks": blocks})
+	# Carry enough on the queue entry to support Zed's three per-row
+	# actions (edit / send-now / delete):
+	#   blocks       → what the ACP adapter sees on send
+	#   display_text → single-line preview for the drawer
+	#   segments     → composer text + inline-chip restore on edit
+	#   attachments  → session.attachments restore on edit
+	queue.append({
+		"blocks": blocks,
+		"display_text": prompt,
+		"segments": prompt_segments.duplicate(true),
+		"attachments": attachments.duplicate(true),
+	})
 	session["queued_prompts"] = queue
 	session["managed_attachment_refs"] = _merge_managed_attachment_refs(
 		session.get("managed_attachment_refs", []),
@@ -2821,7 +3638,13 @@ func _send_prompt() -> void:
 	)
 	sessions[current_session_index] = session
 
-	_append_user_message_to_session(current_session_index, prompt, prompt_segments)
+	# Composer is cleared on enqueue so the user can keep typing the
+	# NEXT prompt immediately. The transcript's user-bubble, however,
+	# only appears when the queued item actually dispatches to the
+	# adapter — see `_dispatch_next_prompt`. Appending the bubble on
+	# enqueue would interleave it into the still-streaming agent
+	# response above, splitting that response into two transcript
+	# entries around the user bubble.
 	if inline_prompt != null:
 		# Chips are one-shot, matching Zed's @-mention behaviour: once
 		# the turn is sent the attachment is consumed and the composer
@@ -2845,7 +3668,12 @@ func _on_send_button_pressed() -> void:
 		return
 
 	var session: Dictionary = sessions[current_session_index]
-	if bool(session.get("busy", false)):
+	# Three-way dispatch matching _refresh_send_state's icon choice:
+	#   idle          → send
+	#   busy + empty  → cancel the current turn
+	#   busy + typed  → queue (route to _send_prompt, which already
+	#                   handles "busy = enqueue" via queued_prompts)
+	if bool(session.get("busy", false)) and not _composer_has_content():
 		_cancel_current_turn(current_session_index)
 		return
 
@@ -2886,8 +3714,19 @@ func _dispatch_next_prompt(session_index: int) -> void:
 	session["busy"] = true
 	session["cancelling"] = false
 	session["assistant_entry_index"] = -1
-	session["plan_entry_index"] = -1
 	sessions[session_index] = session
+
+	# Append the user-bubble to the transcript RIGHT before dispatching.
+	# Done here — not in `_send_prompt` — so that prompts queued while
+	# an earlier turn was still streaming don't interrupt the agent's
+	# in-flight response and split it into two transcript entries.
+	# `_append_user_message_to_session` resets assistant_entry_index,
+	# which is exactly what we want once the current turn is done and
+	# the next one is about to start.
+	var prompt_text := str(next_prompt.get("display_text", ""))
+	var prompt_segments_variant = next_prompt.get("segments", [])
+	var prompt_segments: Array = prompt_segments_variant if prompt_segments_variant is Array else []
+	_append_user_message_to_session(session_index, prompt_text, prompt_segments)
 
 	var request_id: int = int(connection.prompt(remote_session_id, next_prompt.get("blocks", [])))
 	if request_id < 0:
@@ -3407,8 +4246,14 @@ func _on_connection_prompt_finished(agent_id: String, remote_session_id: String,
 	session["assistant_entry_index"] = -1
 	sessions[session_index] = session
 
+	# Silently swallow normal terminations and user-initiated cancels —
+	# Zed's thread view does the same (no "Turn cancelled" system
+	# bubble after a Stop / Send Now interrupt; the stream just stops
+	# mid-flight and the next turn starts clean). Only surface
+	# stopReasons the user genuinely needs to know about
+	# (max_tokens hits, adapter errors, etc).
 	var stop_reason := str(result.get("stopReason", "done"))
-	if stop_reason != "end_turn":
+	if stop_reason != "end_turn" and stop_reason != "cancelled" and stop_reason != "done":
 		_append_transcript_to_session(session_index, "System", "%s finished with %s." % [_agent_label(agent_id), stop_reason])
 
 	# Release any un-revealed smoothing buffer so the final state shows
@@ -3526,19 +4371,36 @@ func _on_connection_stderr_output(agent_id: String, line: String) -> void:
 	_refresh_status()
 
 
-func _on_connection_fs_write_completed(_agent_id: String, _path: String) -> void:
-	# Our fs/write_text_file handler drops bytes straight to disk, bypassing
-	# Godot's resource system. The FileSystem dock only rescans on editor
-	# focus, so newly created files wouldn't appear until the user clicked
-	# away and back. Schedule a deferred scan_changes to pick them up.
-	_schedule_editor_fs_scan()
+func _on_connection_fs_write_completed(_agent_id: String, path: String) -> void:
+	# Our fs/write_text_file handler drops bytes straight to disk,
+	# bypassing Godot's resource system. Poke EditorFileSystem with
+	# the specific path so the FileSystem dock updates without waiting
+	# for the next editor-focus scan. `update_file` is cheap and
+	# targeted — no full-project rescan needed for a single-file write.
+	_update_editor_fs_file(path)
 
 
-# Coalesces bursts of filesystem changes (Write batches, prompt_finished
-# sweeps) into a single EditorFileSystem.scan_changes call per frame.
-# scan_changes is cheap relative to a full scan() — only new / modified /
-# deleted files are re-evaluated — but there's no reason to fire it more
-# than once per batch of writes.
+func _update_editor_fs_file(path: String) -> void:
+	if editor_interface == null or path.is_empty():
+		return
+	var fs := editor_interface.get_resource_filesystem()
+	if fs == null:
+		return
+	# EditorFileSystem expects `res://...` paths. OS-absolute paths that
+	# resolve inside the project get mapped back via ProjectSettings.
+	var resource_path := path
+	if not resource_path.begins_with("res://"):
+		resource_path = ProjectSettings.localize_path(path.replace("\\", "/"))
+	if not resource_path.begins_with("res://"):
+		return
+	fs.update_file(resource_path)
+
+
+# Coalesces bursts of filesystem changes (e.g. a turn that ran multiple
+# Bash commands creating files outside our fs/write_text_file path) into
+# a single full scan per frame. The targeted `update_file` above handles
+# the common case; this catches the "agent shelled out and we don't know
+# which files changed" case on prompt_finished.
 func _schedule_editor_fs_scan() -> void:
 	if editor_fs_scan_pending:
 		return
@@ -3553,7 +4415,11 @@ func _run_editor_fs_scan() -> void:
 	var fs := editor_interface.get_resource_filesystem()
 	if fs == null:
 		return
-	fs.scan_changes()
+	# `scan()` is the catch-all. EditorFileSystem in Godot 4.6 doesn't
+	# expose an incremental-only variant; this queues a full rescan,
+	# which is relatively cheap for small-to-medium projects and is
+	# the official API for picking up out-of-band filesystem changes.
+	fs.scan()
 
 
 func _permission_option_label(option: Dictionary) -> String:
@@ -4266,6 +5132,14 @@ func _flush_thread_menu_refresh() -> void:
 			)
 			popup.set_item_tooltip(popup.get_item_count() - 1, _thread_menu_tooltip(session_index))
 
+	# "Delete" submenu at the bottom, mirroring the full session list.
+	# Each submenu entry deletes that specific thread — gives one-click
+	# access to delete any session, not just the currently active one.
+	# Separator above so it doesn't read as another session row.
+	popup.add_separator()
+	var delete_submenu := _build_delete_submenu()
+	popup.add_submenu_node_item("Delete", delete_submenu)
+
 
 func _refresh_add_menu() -> void:
 	if add_menu == null:
@@ -4715,33 +5589,53 @@ func _refresh_send_state() -> void:
 	var session: Dictionary = sessions[current_session_index]
 	var busy: bool = bool(session.get("busy", false))
 	var cancelling: bool = bool(session.get("cancelling", false))
-	send_button.icon = STOP_ICON if busy else SEND_ICON
-	send_button.tooltip_text = "Stop" if busy else "Send"
+	# Three-state send button (matches Zed):
+	#   idle               → Send (fires _send_prompt immediately)
+	#   busy + has content → Queue (list-end icon; pressing enqueues)
+	#   busy + empty       → Stop (cancels current turn)
+	# "has content" means either typed text or at least one inline chip
+	# on the prompt input, OR unsent attachments on the session.
+	var has_content: bool = _composer_has_content()
+	if busy:
+		if has_content:
+			send_button.icon = QUEUE_ICON
+			send_button.tooltip_text = "Queue this prompt — sends when the current turn ends"
+		else:
+			send_button.icon = STOP_ICON
+			send_button.tooltip_text = "Stop"
+	else:
+		send_button.icon = SEND_ICON
+		send_button.tooltip_text = "Send"
 	send_button.disabled = cancelling
 	_refresh_queue_indicator()
 
 
-func _refresh_queue_indicator() -> void:
-	# Kept distinct from _refresh_send_state so it can be called after a
-	# queue mutation without forcing a send-button repaint. Shows the
-	# pending prompt count for the active session; hidden when zero.
-	if queue_count_label == null:
-		return
-	var count: int = 0
+func _composer_has_content() -> bool:
+	if prompt_input == null:
+		return false
+	var inline_prompt := prompt_input as GodetteComposerPromptInput
+	if inline_prompt != null:
+		if not inline_prompt.get_plain_text().strip_edges().is_empty():
+			return true
+		if not inline_prompt.get_chip_keys_in_order().is_empty():
+			return true
+	else:
+		if not prompt_input.text.strip_edges().is_empty():
+			return true
 	if current_session_index >= 0 and current_session_index < sessions.size():
-		var session: Dictionary = sessions[current_session_index]
-		count = (session.get("queued_prompts", []) as Array).size()
-	if count <= 0:
-		queue_count_label.visible = false
-		queue_count_label.text = ""
-		queue_count_label.tooltip_text = ""
-		return
-	queue_count_label.visible = true
-	queue_count_label.text = "%d queued" % count
-	queue_count_label.tooltip_text = (
-		"Prompts waiting behind the current turn.\n"
-		+ "They'll send automatically in order when the agent finishes."
-	)
+		var attachments := _session_attachments(current_session_index)
+		if not attachments.is_empty():
+			return true
+	return false
+
+
+func _refresh_queue_indicator() -> void:
+	# Queue state now lives in the expandable queue_drawer above the
+	# composer (matches Zed). The old composer-options-bar `N queued`
+	# label has been superseded — this function just forwards to
+	# `_refresh_queue_drawer` so every historical caller keeps driving
+	# the new UI without touching call sites.
+	_refresh_queue_drawer()
 
 
 func _refresh_loading_scanner() -> void:
@@ -5057,7 +5951,7 @@ func _import_remote_sessions(agent_id: String, remote_sessions: Array) -> void:
 			"managed_attachment_refs": [],
 			"transcript": [],
 			"assistant_entry_index": -1,
-			"plan_entry_index": -1,
+			"plan_entries": [],
 			"queued_prompts": [],
 			"tool_calls": {},
 			"available_commands": {},
@@ -5069,7 +5963,8 @@ func _import_remote_sessions(agent_id: String, remote_sessions: Array) -> void:
 			"cancelling": false,
 			"busy": false,
 			"hydrated": true,
-			"updated_at": _timestamp_msec_from_iso(str(remote_session.get("updatedAt", "")))
+			"updated_at": _timestamp_msec_from_iso(str(remote_session.get("updatedAt", ""))),
+			"created_at": _timestamp_msec_from_iso(str(remote_session.get("createdAt", remote_session.get("updatedAt", "")))),
 		}
 		next_session_number += 1
 		sessions.append(session)
@@ -5106,7 +6001,7 @@ func _create_session(agent_id: String, switch_to_new: bool, connect_remote: bool
 		"managed_attachment_refs": [],
 		"transcript": [],
 		"assistant_entry_index": -1,
-		"plan_entry_index": -1,
+		"plan_entries": [],
 		"queued_prompts": [],
 		"tool_calls": {},
 		"available_commands": {},
@@ -5118,7 +6013,8 @@ func _create_session(agent_id: String, switch_to_new: bool, connect_remote: bool
 		"cancelling": false,
 		"busy": false,
 		"hydrated": true,
-		"updated_at": _now_tick()
+		"updated_at": _now_tick(),
+		"created_at": _now_tick(),
 	}
 	next_session_number += 1
 	sessions.append(session)
@@ -5180,6 +6076,8 @@ func _switch_session(index: int) -> void:
 	_refresh_add_menu()
 	_refresh_composer_context()
 	_refresh_chat_log()
+	_refresh_plan_drawer()
+	_refresh_queue_drawer()
 	_refresh_composer_options()
 	_refresh_send_state()
 	_refresh_status()
@@ -5189,6 +6087,33 @@ func _switch_session(index: int) -> void:
 
 func _append_user_message_to_session(session_index: int, text: String, segments: Array = []) -> void:
 	_append_transcript_to_session(session_index, "You", text, segments)
+	# Capture the first user message as a derived title on the session
+	# metadata so the thread menu shows real content (not "Session 14")
+	# for sessions other than the currently hydrated one. Only set it
+	# ONCE — the session's identity is anchored to its first message,
+	# not the latest.
+	if session_index < 0 or session_index >= sessions.size():
+		return
+	var session: Dictionary = sessions[session_index]
+	if str(session.get("derived_title", "")).strip_edges().is_empty():
+		var snippet := _snippet_from_user_text(text)
+		if not snippet.is_empty():
+			session["derived_title"] = snippet
+			sessions[session_index] = session
+			_schedule_persist_state()
+
+
+func _snippet_from_user_text(text: String) -> String:
+	var trimmed := text.strip_edges()
+	if trimmed.is_empty():
+		return ""
+	var newline_index := trimmed.find("\n")
+	if newline_index >= 0:
+		trimmed = trimmed.substr(0, newline_index).strip_edges()
+	const MAX_SNIPPET_CHARS := 48
+	if trimmed.length() > MAX_SNIPPET_CHARS:
+		trimmed = trimmed.substr(0, MAX_SNIPPET_CHARS).strip_edges() + "…"
+	return trimmed
 
 
 func _append_system_message(text: String) -> void:
@@ -5451,49 +6376,22 @@ func _upsert_plan_entry(session_index: int, entries_variant) -> void:
 			})
 
 	var session: Dictionary = sessions[session_index]
-	var current_transcript: Array = session.get("transcript", [])
-	var plan_entry_index: int = int(session.get("plan_entry_index", -1))
+	session["plan_entries"] = normalized_entries
 
-	# Any fresh plan update clears the dismissal — users expect the panel
+	# A fresh plan update un-dismisses the drawer — users expect the panel
 	# to reappear when the agent actually changes its plan, even if they
-	# × closed the last version. This runs before the transcript mutation
-	# below so the subsequent feed rebuild picks up the un-dismissed state.
+	# × closed the previous version.
 	var session_scope_key := "%s|%s" % [
 		str(session.get("agent_id", DEFAULT_AGENT_ID)),
 		str(session.get("remote_session_id", "")),
 	]
 	plan_dismissed_sessions.erase(session_scope_key)
 
-	var plan_is_new := false
-	if plan_entry_index >= 0 and plan_entry_index < current_transcript.size():
-		var current_entry: Dictionary = current_transcript[plan_entry_index]
-		current_entry["kind"] = "plan"
-		current_entry["speaker"] = "Plan"
-		current_entry["entries"] = normalized_entries
-		current_entry["content"] = ""
-		current_transcript[plan_entry_index] = current_entry
-	else:
-		current_transcript.append({
-			"kind": "plan",
-			"speaker": "Plan",
-			"entries": normalized_entries,
-			"content": ""
-		})
-		plan_entry_index = current_transcript.size() - 1
-		session["plan_entry_index"] = plan_entry_index
-		plan_is_new = true
-		session["assistant_entry_index"] = -1
-		session["thought_entry_index"] = -1
-
-	session["transcript"] = current_transcript
 	sessions[session_index] = session
 	_touch_session(session_index)
 
 	if session_index == current_session_index:
-		if plan_is_new:
-			_append_entry_to_feed(plan_entry_index)
-		else:
-			_update_entry_in_feed(plan_entry_index)
+		_refresh_plan_drawer()
 
 
 func _upsert_tool_call_entry(session_index: int, update: Dictionary) -> void:
@@ -5733,6 +6631,7 @@ func _on_composer_chips_changed(ordered_keys: Array) -> void:
 
 	_set_session_attachments(current_session_index, reordered)
 	_refresh_status()
+	_refresh_send_state()
 	_schedule_persist_state()
 
 
@@ -5856,11 +6755,72 @@ func _current_agent_id() -> String:
 
 
 func _on_thread_menu_id_pressed(item_id: int) -> void:
+	if item_id >= THREAD_MENU_DELETE_ID_OFFSET:
+		# Delete submenu entry — ID range is [DELETE_OFFSET, ∞).
+		var delete_index: int = item_id - THREAD_MENU_DELETE_ID_OFFSET
+		_confirm_delete_session(delete_index)
+		return
 	if item_id < THREAD_MENU_SESSION_ID_OFFSET:
 		return
 
 	var session_index: int = item_id - THREAD_MENU_SESSION_ID_OFFSET
 	_switch_session(session_index)
+
+
+func _build_delete_submenu() -> PopupMenu:
+	var submenu := PopupMenu.new()
+	submenu.name = "DeleteSubmenu"
+	submenu.id_pressed.connect(Callable(self, "_on_thread_menu_id_pressed"))
+	# List every session in the same order as the parent menu so the
+	# user's spatial mapping "row here = delete that" stays consistent.
+	var recent_indices: Array = _recent_session_indices(RECENT_SESSION_LIMIT)
+	var listed: Dictionary = {}
+	for session_index_variant in recent_indices:
+		var session_index: int = int(session_index_variant)
+		submenu.add_icon_item(
+			_agent_icon_texture(str(sessions[session_index].get("agent_id", DEFAULT_AGENT_ID)), THREAD_MENU_AGENT_ICON_SIZE),
+			_thread_menu_label(session_index),
+			THREAD_MENU_DELETE_ID_OFFSET + session_index
+		)
+		submenu.set_item_tooltip(submenu.get_item_count() - 1, "Delete %s" % _session_display_title(sessions[session_index]))
+		listed[session_index] = true
+	for session_index in range(sessions.size()):
+		if listed.has(session_index):
+			continue
+		submenu.add_icon_item(
+			_agent_icon_texture(str(sessions[session_index].get("agent_id", DEFAULT_AGENT_ID)), THREAD_MENU_AGENT_ICON_SIZE),
+			_thread_menu_label(session_index),
+			THREAD_MENU_DELETE_ID_OFFSET + session_index
+		)
+		submenu.set_item_tooltip(submenu.get_item_count() - 1, "Delete %s" % _session_display_title(sessions[session_index]))
+	return submenu
+
+
+func _confirm_delete_session(session_index: int) -> void:
+	if session_index < 0 or session_index >= sessions.size():
+		return
+	var session: Dictionary = sessions[session_index]
+	var title := _session_display_title(session)
+
+	# ConfirmationDialog as a child of the dock so it inherits the
+	# editor theme + gets cleaned up when the dock is freed. Binding
+	# `session_index` into the confirmed handler freezes the target
+	# so a later `_refresh_thread_menu` re-ordering can't shift
+	# which session gets evicted after the user has already decided.
+	var dialog := ConfirmationDialog.new()
+	dialog.title = "Delete Thread"
+	dialog.dialog_text = "Delete thread \"%s\"?\n\nThis removes the transcript from disk and can't be undone." % title
+	dialog.ok_button_text = "Delete"
+	dialog.get_ok_button().modulate = Color(1.0, 0.55, 0.55, 1.0)
+	add_child(dialog)
+	var target_index := session_index
+	dialog.confirmed.connect(func():
+		_evict_session(target_index)
+		dialog.queue_free()
+	)
+	dialog.canceled.connect(func(): dialog.queue_free())
+	dialog.close_requested.connect(func(): dialog.queue_free())
+	dialog.popup_centered()
 
 
 func _on_thread_switcher_pressed() -> void:
@@ -5895,37 +6855,3 @@ func _on_add_menu_id_pressed(item_id: int) -> void:
 	_create_session(selected_agent_id, true, true)
 
 
-# Label subclass that draws a single strike-through line across its own
-# content rect when `struck` is true. Used by the Plan panel to show
-# completed tasks — Godot's theme system has no native strike-through and
-# RichTextLabel is intentionally not used in this addon (see the repo's
-# rendering-stack policy). Kept as an inner class because no other widget
-# needs the behaviour.
-class PlanTaskLabel extends Label:
-	var struck: bool = false:
-		set(value):
-			if struck == value:
-				return
-			struck = value
-			queue_redraw()
-
-	func _draw() -> void:
-		if not struck:
-			return
-		var sz: Vector2 = get_size()
-		if sz.x <= 0.0 or sz.y <= 0.0:
-			return
-		# Pick a colour that tracks the Label's own theme rather than
-		# hard-coding white — otherwise a light theme would paint a bright
-		# strike over near-black glyphs and look ridiculous. The 0.7 alpha
-		# factor keeps the line subtle; the glyphs themselves are what the
-		# user reads, the strike is only an accent.
-		var col: Color = Color(1, 1, 1, 1)
-		if has_theme_color("font_color"):
-			col = get_theme_color("font_color")
-		col.a *= 0.7
-		# y = 54% of height puts the line through the x-height of typical
-		# fonts (slightly above center, since descenders add slack below
-		# and caps don't extend above the nominal top).
-		var y: float = sz.y * 0.54
-		draw_line(Vector2(0, y), Vector2(sz.x, y), col, 1.0)
