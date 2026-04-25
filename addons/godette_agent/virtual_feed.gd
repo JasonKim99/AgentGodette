@@ -31,9 +31,27 @@ const DEFAULT_OVERSCAN_ROWS := 3
 
 var _entries: Array = []
 var _heights: PackedFloat32Array = PackedFloat32Array()
+# Per-entry measurement state, mirrors Zed's `ItemState::Unrendered` /
+# `Rendered` distinction (vendor/zed/crates/gpui/src/elements/list.rs):
+# 0 = unmeasured (height in `_heights[i]` is the estimate placeholder),
+# 1 = measured (height is the entry's real `get_combined_minimum_size().y`
+# at our current width). `_heights[i]` is always a real number — the old
+# `-1` sentinel encoded both state and value in one slot, which made every
+# read site duplicate the fallback-to-estimate logic. Splitting the two
+# means callers can read `_heights[i]` directly without thinking.
+var _measured: PackedByteArray = PackedByteArray()
 var _controls: Dictionary = {}  # entry_index -> Control
 var _ordered_y: PackedFloat32Array = PackedFloat32Array()  # cumulative, size = entries + 1
 var _ordered_y_dirty: bool = true
+# True once `_warm_up_measure_all()` has populated `_measured` for every
+# entry in the current snapshot. Goes false on any snapshot/append/update.
+# Equivalent to "all items are in the Rendered state" in Zed's list.rs.
+# Currently informational — read sites still tolerate unmeasured rows via
+# the estimate — but lets future code gate operations on warm-up
+# completion (e.g. "do not auto-scroll to a fractional anchor until heights
+# settle").
+var _warmed_up: bool = false
+var _warm_up_pending: bool = false
 
 var _builder: Callable
 var _scroll: ScrollContainer = null
@@ -110,10 +128,20 @@ func set_entries_snapshot(entries: Array) -> void:
 	_destroy_all_controls()
 	_entries = entries.duplicate()
 	_heights.resize(_entries.size())
+	_measured.resize(_entries.size())
 	for i in range(_entries.size()):
-		_heights[i] = -1.0
+		_heights[i] = _estimated_row_height
+		_measured[i] = 0
+	_warmed_up = _entries.is_empty()
 	_ordered_y_dirty = true
 	_update_virtual_height()
+	# Warm-up: measure every entry's real height before anything paints,
+	# so virtual_height is correct from frame 1 instead of growing toward
+	# truth as rows scroll into view. Mirrors Zed's `layout_all_items()`
+	# warm-up pass (vendor/zed/crates/gpui/src/elements/list.rs:340-387).
+	# Deferred so the layout cascade can settle our own width first —
+	# warm-up at width=0 produces garbage measurements.
+	_schedule_warm_up()
 	_schedule_materialize()
 
 
@@ -121,8 +149,10 @@ func clear_entries() -> void:
 	_destroy_all_controls()
 	_entries.clear()
 	_heights.resize(0)
+	_measured.resize(0)
 	_ordered_y.resize(0)
 	_ordered_y_dirty = false
+	_warmed_up = true
 	_update_virtual_height()
 
 
@@ -133,10 +163,17 @@ func append_entry(entry: Dictionary) -> void:
 	# burst would re-sum every height on every append (O(n²)) and freeze
 	# the main thread.
 	_entries.append(entry)
-	_heights.append(-1.0)
+	_heights.append(_estimated_row_height)
+	_measured.append(0)
+	_warmed_up = false
 	_ordered_y_dirty = true
 	_virtual_height += _estimated_row_height
 	_mark_virtual_height_dirty()
+	# Single-entry warm-up: append happens hot during session/load replay
+	# (one per ACP session_update). Letting these accumulate as Unmeasured
+	# means virtual_height stays at N×estimate until each row scrolls
+	# into view, which is exactly the bug the warm-up exists to prevent.
+	_schedule_warm_up()
 	_schedule_materialize()
 
 
@@ -144,17 +181,19 @@ func update_entry(entry_index: int, entry: Dictionary) -> void:
 	if entry_index < 0 or entry_index >= _entries.size():
 		return
 	_entries[entry_index] = entry
-	var prev_height: float = _heights[entry_index]
-	_heights[entry_index] = -1.0
+	var was: float = _heights[entry_index]
+	_heights[entry_index] = _estimated_row_height
+	_measured[entry_index] = 0
+	_warmed_up = false
 	var existing: Variant = _controls.get(entry_index, null)
 	if existing != null and is_instance_valid(existing) and existing is Control:
 		_free_control(entry_index)
 	_ordered_y_dirty = true
-	# Adjust virtual height incrementally: was using prev height (or estimate
-	# if unmeasured), now using estimate until remeasure.
-	var was: float = prev_height if prev_height > 0.0 else _estimated_row_height
+	# Adjust virtual height incrementally: was using prev height,
+	# now using estimate until remeasure.
 	_virtual_height += (_estimated_row_height - was)
 	_mark_virtual_height_dirty()
+	_schedule_warm_up()
 	_schedule_materialize()
 
 
@@ -181,6 +220,11 @@ func _notification(what: int) -> void:
 		# Retrigger materialize whenever visibility flips on, catching
 		# the "tab was hidden, now shown" case.
 		if is_visible_in_tree() and not _entries.is_empty():
+			# Width may have become known while we were hidden; retrigger
+			# warm-up in case the snapshot landed before the dock tab
+			# was activated.
+			if not _warmed_up:
+				_schedule_warm_up()
 			_schedule_materialize()
 		return
 	if what == NOTIFICATION_RESIZED:
@@ -205,7 +249,19 @@ func _notification(what: int) -> void:
 		# corrects the next time they enter view). Only visible rows need
 		# to re-measure immediately.
 		_ordered_y_dirty = true
+		# Width changed → wrap-derived heights for offscreen entries are
+		# now wrong. Mark them all unmeasured and retrigger warm-up so the
+		# scrollbar range stays accurate without waiting for each entry
+		# to scroll into view. Materialized entries are remeasured
+		# immediately via _remeasure_visible (their controls already exist;
+		# building a duplicate in warm-up would be wasted work).
+		for i in range(_entries.size()):
+			if _controls.has(i):
+				continue
+			_measured[i] = 0
+		_warmed_up = false
 		_remeasure_visible()
+		_schedule_warm_up()
 		_schedule_materialize()
 
 
@@ -237,6 +293,8 @@ func _connect_scroll_signals() -> void:
 	if _follow_tail and not _follow_tail_pending:
 		_follow_tail_pending = true
 		call_deferred("_flush_follow_tail")
+	if not _warmed_up:
+		_schedule_warm_up()
 	if not _materialize_pending:
 		_materialize_pending = true
 		call_deferred("_flush_materialize")
@@ -339,6 +397,101 @@ func scroll_to_top() -> void:
 		_scroll.scroll_vertical = 0
 
 
+# ---------------------------------------------------------------------------
+# Warm-up measurement
+# ---------------------------------------------------------------------------
+#
+# Ports Zed's `layout_all_items()` warm-up pass (vendor/zed/crates/gpui/
+# src/elements/list.rs:340-387). On a fresh entry set we want every row's
+# real height in the cache before the first paint — without it,
+# virtual_height stays at N×estimate until rows scroll into view, the
+# ScrollContainer's scrollbar range under-reports the true content
+# extent, and content visually extends below the viewport with no way
+# to scroll there. That was the "reload session, no scrollbar" bug.
+#
+# The pass is synchronous within a single deferred flush: build each
+# unmeasured entry off-screen, read get_combined_minimum_size(), free.
+# The cost is O(entries) builder calls per snapshot; with the typical
+# transcript size (≤100 entries) the perceptible freeze is well under
+# 200ms.
+#
+# Skipped while `size.x <= 0` — measuring at width 0 produces garbage
+# wrap heights. The width-becomes-known path (NOTIFICATION_RESIZED,
+# visibility flips) re-schedules warm-up so first-frame snapshots
+# eventually settle.
+
+
+func _schedule_warm_up() -> void:
+	if _warm_up_pending:
+		return
+	_warm_up_pending = true
+	call_deferred("_flush_warm_up")
+
+
+func _flush_warm_up() -> void:
+	_warm_up_pending = false
+	_warm_up_measure_all()
+
+
+func _warm_up_measure_all() -> void:
+	if _warmed_up:
+		return
+	if _entries.is_empty():
+		_warmed_up = true
+		return
+	if size.x <= 0.0 or not _builder.is_valid():
+		# Bail until we have width and a builder; another retrigger will
+		# come (resize / visibility / configure).
+		return
+
+	var changed: bool = false
+	for i in range(_entries.size()):
+		if _measured[i] == 1:
+			continue
+		if _controls.has(i):
+			# Currently materialized — the normal _measure_entry path will
+			# stamp `_measured` for it. Skip to avoid double-build.
+			continue
+		var entry_variant = _entries[i]
+		if typeof(entry_variant) != TYPE_DICTIONARY:
+			# Not buildable; treat the estimate as the final answer rather
+			# than leaving it unmeasured forever.
+			_measured[i] = 1
+			changed = true
+			continue
+		var ctrl_variant = _builder.call(entry_variant, i)
+		if not (ctrl_variant is Control):
+			_measured[i] = 1
+			changed = true
+			continue
+		var ctrl: Control = ctrl_variant
+		add_child(ctrl)
+		# Width is the only constraint that matters for wrap-derived
+		# heights. Position off-screen so the temporary control doesn't
+		# flash into view between add_child and queue_free (queue_free
+		# defers destruction to end-of-frame, so the ctrl draws once
+		# unless we hide it). `visible = false` would short-circuit some
+		# Container layouts and corrupt the measurement, so we use
+		# off-screen position instead.
+		ctrl.size.x = size.x
+		ctrl.position = Vector2(-99999.0, 0.0)
+		var measured: float = max(ctrl.get_combined_minimum_size().y, _estimated_row_height)
+		_heights[i] = measured
+		_measured[i] = 1
+		ctrl.queue_free()
+		changed = true
+
+	_warmed_up = true
+	if changed:
+		_ordered_y_dirty = true
+		_update_virtual_height()
+		_schedule_materialize()
+		# follow-tail re-pins now that virtual_height reflects truth.
+		if _follow_tail and not _follow_tail_pending:
+			_follow_tail_pending = true
+			call_deferred("_flush_follow_tail")
+
+
 func _schedule_materialize() -> void:
 	if _materialize_pending:
 		return
@@ -368,7 +521,6 @@ func _ensure_cumulative_y() -> void:
 	var running: float = 0.0
 	for i in range(_entries.size()):
 		_ordered_y[i] = running
-		var h: float = -1.0
 		# For materialized entries, the live control's `size.y` is the
 		# authoritative source — that's literally what gets rendered. The
 		# `_heights[i]` cache can drift behind reality when a Container
@@ -381,13 +533,10 @@ func _ensure_cumulative_y() -> void:
 		if _controls.has(i):
 			var ctrl_variant: Variant = _controls[i]
 			if ctrl_variant is Control and is_instance_valid(ctrl_variant):
-				h = (ctrl_variant as Control).size.y
-				_heights[i] = h
-		if h < 0.0:
-			h = _heights[i]
-		if h < 0.0:
-			h = _estimated_row_height
-		running += h
+				var live_h: float = (ctrl_variant as Control).size.y
+				_heights[i] = live_h
+				_measured[i] = 1
+		running += _heights[i]
 	_ordered_y[_entries.size()] = running
 	_ordered_y_dirty = false
 
@@ -483,7 +632,7 @@ func _search_first_top_after(y: float) -> int:
 
 func _materialize_visible_range() -> void:
 	var vis_range := _compute_visible_range()
-	# Free controls outside the range.
+	# Free controls outside the range — cheap, batch all at once.
 	var to_free: Array = []
 	for key in _controls.keys():
 		var idx: int = int(key)
@@ -491,15 +640,45 @@ func _materialize_visible_range() -> void:
 			to_free.append(idx)
 	for idx in to_free:
 		_free_control(int(idx))
-	# Materialize missing in-range entries.
-	var changed: bool = false
+
+	# Materialize at most ONE missing in-range entry per flush, then
+	# schedule another flush for the rest. This serialises what was
+	# previously "build every visible entry in the same frame, then
+	# rely on Godot's deferred layout cascade to settle them all in
+	# parallel" — the parallel cascade made historical-session reload
+	# unstable: N ListBlocks all firing minimum_size_changed inside one
+	# frame interleaved through a single VBox queue_sort, with each
+	# ListBlock's _sync_paragraphs running while its siblings hadn't
+	# yet stabilised their own widths. Symptom: heights computed at
+	# the wrong width, virtual_height wrong, scroll broken.
+	#
+	# Serialising means each entry gets its own clean frame to:
+	#   1. Build (force-resolved min via _build_chat_message_entry).
+	#   2. add_child + initial size apply.
+	#   3. NOTIFICATION_RESIZED at real width on the next frame.
+	#   4. _measure_entry's call_deferred fires on a settled control.
+	# Cost: N frames to populate N visible entries. At 60 fps a 10-row
+	# session loads visually in ~167ms — noticeable but worth the
+	# correctness gain. Streaming-append is unaffected (only one entry
+	# is added there per turn).
+	var built: bool = false
+	var more_pending: bool = false
 	for i in range(vis_range.x, vis_range.y):
 		if _controls.has(i):
 			continue
+		if built:
+			more_pending = true
+			break
 		_materialize(i)
-		changed = true
-	if changed:
+		built = true
+
+	if built:
 		_update_virtual_height()
+	if more_pending and not _materialize_pending:
+		# Use the existing pending flag + deferred plumbing so a burst
+		# of mid-flow scroll events doesn't queue 50 redundant flushes.
+		_materialize_pending = true
+		call_deferred("_flush_materialize")
 
 
 func _materialize(entry_index: int) -> void:
@@ -517,19 +696,12 @@ func _materialize(entry_index: int) -> void:
 	add_child(ctrl)
 	# Width is authoritative immediately so Container descendants start wrap
 	# calculations with the right constraint; height seeds from the cached
-	# measurement when one exists (row scrolled out and back in), falling
-	# back to the estimate only for never-measured rows. Two reasons:
-	#   1. Cached-height path: avoids a one-frame size flash (60 px then
-	#      real height) as the user scrolls rows back into view. That
-	#      flash read as a visible flicker on every wheel tick.
-	#   2. We MUST NOT clobber `_heights[entry_index]` here itself — that
-	#      would make cumulative_y rebuilds treat re-entering rows as
-	#      unmeasured, collapse `_virtual_height`, and yank the scrollbar
-	#      back (the old "scrolling does nothing" bug).
-	var initial_h: float = _heights[entry_index]
-	if initial_h < 0.0:
-		initial_h = _estimated_row_height
-	ctrl.size = Vector2(size.x, initial_h)
+	# measurement (the warm-up pass populates this for every entry, so
+	# `_heights[i]` is always a real number — measured or estimate, but
+	# never the old `-1` sentinel). Avoiding the size flash matters because
+	# scrolling a row out and back in used to flicker (60 px → real height)
+	# on every wheel tick.
+	ctrl.size = Vector2(size.x, _heights[entry_index])
 	ctrl.position = Vector2(0.0, _ordered_y[entry_index])
 	_controls[entry_index] = ctrl
 	if not ctrl.minimum_size_changed.is_connected(_on_entry_min_size_changed):
@@ -563,23 +735,17 @@ func _measure_entry(entry_index: int) -> void:
 	if not is_instance_valid(ctrl):
 		return
 	var min_y: float = max(ctrl.get_combined_minimum_size().y, _estimated_row_height)
-	# `_heights[i] = -1.0` is the "unmeasured" sentinel; the virtual-height
-	# and cumulative-y math all treat that as _estimated_row_height, so we
-	# must do the same here. Using -1 directly would compute a delta of
-	# `min_y - (-1)` per first measure, over-inflating the total scroll
-	# height and leaving a phantom empty gap below the last entry.
-	# Remember whether this was the first real measurement (transitioning
-	# from the estimate placeholder) — the anchor-preservation branch
-	# below keys off it.
-	var was_unmeasured: bool = _heights[entry_index] < 0.0
+	# `_heights[entry_index]` is always a real number under the new
+	# explicit-state regime — `_measured[entry_index]` says whether it's
+	# the estimate placeholder (0) or a real measurement (1). The anchor-
+	# preservation branch below keys off the transition.
+	var was_unmeasured: bool = _measured[entry_index] == 0
 	var prev: float = _heights[entry_index]
-	if was_unmeasured:
-		prev = _estimated_row_height
 	if abs(min_y - prev) < 0.5:
-		# Even when the height matches, stamp the real value so the stored
-		# cache no longer reads as "unmeasured" — otherwise subsequent
-		# cumulative_y rebuilds still use the estimate fallback.
+		# Stamp measured even when the value matches the estimate, so
+		# subsequent reads stop treating the entry as unmeasured.
 		_heights[entry_index] = min_y
+		_measured[entry_index] = 1
 		return
 
 	# Snapshot the scroll anchor BEFORE mutating heights. _ordered_y is
@@ -593,6 +759,7 @@ func _measure_entry(entry_index: int) -> void:
 
 	var delta: float = min_y - prev
 	_heights[entry_index] = min_y
+	_measured[entry_index] = 1
 	ctrl.size.y = min_y
 	_ordered_y_dirty = true
 	_virtual_height += delta

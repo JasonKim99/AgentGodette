@@ -46,6 +46,7 @@ extends RefCounted
 
 const TextBlockScript = preload("res://addons/godette_agent/text_block.gd")
 const SelectionScript = preload("res://addons/godette_agent/markdown_selection_manager.gd")
+const ListBlockScript = preload("res://addons/godette_agent/list_block.gd")
 
 # Heading sizes are deltas added to the caller's base_font_size, mirroring
 # the proportions browsers use (h1 ~1.6x, h2 ~1.4x, down to h6 = body).
@@ -135,12 +136,13 @@ static func render_events(events: Array, ctx: Dictionary) -> Control:
 
 
 # Walk the stack from top to find the innermost text target. Returns null
-# when no open block accepts text (e.g. we're sitting directly inside a
-# `table` frame between rows).
-static func _current_text_target(stack: Array) -> GodetteTextBlock:
+# when no open block accepts text. Returns Object (not strict TextBlock)
+# so ListBlock — which exposes the same `append_span` / `append_text`
+# surface but isn't a TextBlock subclass — can also be a target.
+static func _current_text_target(stack: Array) -> Object:
 	for i in range(stack.size() - 1, -1, -1):
 		var tt = (stack[i] as Dictionary).get("text_target", null)
-		if tt is GodetteTextBlock:
+		if tt is Object and is_instance_valid(tt) and tt.has_method("append_span"):
 			return tt
 	return null
 
@@ -225,58 +227,41 @@ static func _handle_start(ev: Dictionary, stack: Array, ctx: Dictionary) -> void
 			stack.append({"tag": tag, "container": panel, "text_target": tb})
 
 		"list":
-			# `list` is a pure container — no text target of its own. Its
-			# frame tracks `ordered` + a running counter so child list_item
-			# frames can pick the next "1." / "2." when ordered=true.
-			var list_box := VBoxContainer.new()
-			list_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-			list_box.add_theme_constant_override("separation", 2)
-			_current_container(stack).add_child(list_box)
+			# Route 3 PoC re-enabled for swap-bug diagnostic.
+			var list_block: GodetteListBlock = ListBlockScript.new()
+			list_block.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+			list_block.set_color(ctx["fg"])
+			list_block.set_fonts(
+				null,
+				ctx["font_bold"],
+				ctx["font_italic"],
+				ctx["font_bold_italic"],
+				ctx["font_mono"]
+			)
+			list_block.set_font_size(int(ctx["base_font_size"]))
+			list_block.set_line_spacing(float(ctx["line_spacing"]))
+			list_block.set_ordered(bool(ev.get("ordered", false)))
+
+			var indent := MarginContainer.new()
+			indent.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+			indent.add_theme_constant_override("margin_left", LIST_INDENT)
+			indent.add_child(list_block)
+			_current_container(stack).add_child(indent)
+
 			stack.append({
 				"tag": tag,
-				"container": list_box,
-				"text_target": null,
+				"container": indent,
+				"text_target": list_block,
+				"list_block": list_block,
 				"ordered": bool(ev.get("ordered", false)),
-				"list_counter": 0,
 			})
 
 		"list_item":
 			var list_frame: Dictionary = stack[stack.size() - 1]
-			var ordered: bool = bool(list_frame.get("ordered", false))
-			var counter: int = int(list_frame.get("list_counter", 0)) + 1
-			list_frame["list_counter"] = counter
-			var marker_text: String = "•" if not ordered else ("%d." % counter)
-			# Layout: [left indent (via MarginContainer)] → HBox[marker, body]
-			#   marker sits in a fixed-width column so `•`, `1.`, `10.` all
-			#   line up; the body text starts at the same x regardless. Gap
-			#   between marker and body is HBox separation.
-			var marker_col_w: int = int(round(float(ctx["base_font_size"]) * LIST_MARKER_EMS))
-			var outer := MarginContainer.new()
-			outer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-			outer.add_theme_constant_override("margin_left", LIST_INDENT)
-			var row := HBoxContainer.new()
-			row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-			row.add_theme_constant_override("separation", LIST_MARKER_GAP)
-			outer.add_child(row)
-			var marker_tb := _make_textblock(ctx, false)
-			marker_tb.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
-			marker_tb.size_flags_vertical = Control.SIZE_SHRINK_BEGIN
-			marker_tb.custom_minimum_size = Vector2(marker_col_w, 0)
-			marker_tb.set_text(marker_text)
-			marker_tb.mouse_filter = Control.MOUSE_FILTER_IGNORE
-			row.add_child(marker_tb)
-			# Body TB: register manually with `outer` as hit area. The
-			# TextBlock itself sits to the right of the marker column, so a
-			# drag passing through the item's left indent or marker column
-			# would otherwise skip this item. Using `outer` (the full
-			# indented row) as hit_area makes the whole row behave like a
-			# single logical target.
-			var tb := _make_textblock(ctx, false)
-			tb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-			row.add_child(tb)
-			_register_with_hit_area(tb, outer, ctx)
-			_current_container(stack).add_child(outer)
-			stack.append({"tag": tag, "container": outer, "text_target": tb})
+			var lb_v = list_frame.get("list_block", null)
+			if lb_v != null and lb_v.has_method("begin_item"):
+				lb_v.begin_item()
+			stack.append({"tag": tag, "container": null, "text_target": null})
 
 		"table":
 			# Outer PanelContainer gives the grid its visible border; the
@@ -398,6 +383,13 @@ static func _handle_end(ev: Dictionary, stack: Array) -> void:
 	var top: Dictionary = stack[stack.size() - 1]
 	if top.get("tag", "") != expected:
 		push_warning("[godette/md] end '%s' but stack top is '%s'" % [expected, top.get("tag", "")])
+	# Route 3: list_item end finalises the current item on the enclosing
+	# ListBlock so it shapes + measures incrementally as items arrive.
+	if expected == "list_item" and stack.size() >= 2:
+		var enclosing: Dictionary = stack[stack.size() - 2]
+		var lb_v = enclosing.get("list_block", null)
+		if lb_v != null and is_instance_valid(lb_v) and lb_v.has_method("end_item"):
+			lb_v.end_item()
 	stack.pop_back()
 
 

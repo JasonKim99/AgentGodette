@@ -5,6 +5,20 @@ const ACPConnectionScript = preload("res://addons/godette_agent/acp_connection.g
 const TextBlockScript = preload("res://addons/godette_agent/text_block.gd")
 const MarkdownScript = preload("res://addons/godette_agent/markdown.gd")
 const MarkdownRenderScript = preload("res://addons/godette_agent/markdown_render.gd")
+# Phase 2 of the flat-draw refactor (design/flat_draw.md). When
+# USE_FLAT_RENDER is true, finalized assistant markdown routes through
+# GodetteFlatRender (one RichTextLabel per continuous run + dedicated
+# Controls for code blocks / rules) instead of GodetteMarkdownRender's
+# per-block Container subtree. Default off until visual parity is verified
+# end-to-end; flip to true to A/B against the legacy path.
+const FlatRenderScript = preload("res://addons/godette_agent/flat_render.gd")
+# Default OFF after Phase 2 verification surfaced compounding RTL sizing
+# issues (table region collapses, long content doesn't scroll, code block
+# styling missing — all traceable to RichTextLabel's `fit_content` /
+# minimum_size_changed not propagating cleanly when nested inside a
+# VBoxContainer that VirtualFeed measures). The flat-render code stays in
+# tree for continued investigation; flip back to `true` to reproduce.
+const USE_FLAT_RENDER: bool = false
 const SessionStoreScript = preload("res://addons/godette_agent/session_store.gd")
 const VirtualFeedScript = preload("res://addons/godette_agent/virtual_feed.gd")
 const LoadingScannerScript = preload("res://addons/godette_agent/loading_scanner.gd")
@@ -2395,6 +2409,19 @@ func _build_chat_message_entry(entry: Dictionary, kind: String, entry_index: int
 	if entry_index >= 0:
 		_attach_assistant_block_right_click(assistant_text, entry_index)
 	assistant_wrapper.add_child(assistant_text)
+	# Force-resolve minimum size before returning. Without this, the
+	# streaming → finalized swap leaves the new markdown tree's
+	# `get_combined_minimum_size()` cached at a stale (often 0) value
+	# from before the tree was populated — VirtualFeed then measures the
+	# entry as 0 px tall and the whole assistant message visually
+	# disappears. Calling get_combined_minimum_size() here forces Godot
+	# to walk the tree synchronously, triggering each Control's
+	# `_get_minimum_size` (notably ListBlock's `_sync_paragraphs`)
+	# before VirtualFeed's first measure, so the cache is fresh.
+	# Discovery: an exploratory diagnostic print called this function
+	# as a side-effect and accidentally fixed the bug; preserving the
+	# call makes that fix permanent.
+	assistant_wrapper.get_combined_minimum_size()
 	return assistant_wrapper
 
 
@@ -2786,14 +2813,25 @@ func _make_stream_text(text: String, kind: String = "") -> Control:
 # footnote, etc.) a parser-only change.
 func _make_markdown_blocks(text: String, kind: String) -> Control:
 	# Thin wrapper. Sanitises the text, parses it, hands the event stream
-	# off to GodetteMarkdownRender along with a ctx built from the
-	# editor theme. The renderer owns all block-widget assembly; the dock
-	# stays out of markdown internals.
+	# off to a renderer along with a ctx built from the editor theme.
+	# The renderer owns all block-widget assembly; the dock stays out of
+	# markdown internals.
+	#
+	# `USE_FLAT_RENDER` selects between:
+	#   - false (legacy): GodetteMarkdownRender → per-block Container tree.
+	#   - true  (Phase 2): GodetteFlatRender → 1 RichTextLabel per
+	#       continuous markdown run, dedicated Controls only for code
+	#       blocks and rules. See design/flat_draw.md.
+	# Both consume the same parser event stream; only the renderer
+	# differs, so the swap is contained to this function.
 	var safe: String = _safe_text(text)
 	var events: Array = MarkdownScript.parse(safe)
 	if events.is_empty():
 		return _make_stream_text(text, kind)
-	return MarkdownRenderScript.render_events(events, _markdown_render_context(kind))
+	var ctx: Dictionary = _markdown_render_context(kind)
+	if USE_FLAT_RENDER:
+		return FlatRenderScript.render_events(events, ctx)
+	return MarkdownRenderScript.render_events(events, ctx)
 
 
 # Resolve the per-render fonts/colors once per assistant message so each
