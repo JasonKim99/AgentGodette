@@ -9,6 +9,11 @@
 # Local prototypes / scratch scenes (not shipped)
 /prototypes/pong/
 
+# Local-only architecture / design docs — not committed, not imported by
+# Godot. The .gdignore inside the folder keeps Godot's resource scanner
+# out of any .md / scratch files we drop here.
+/design/
+
 # OS
 .DS_Store
 Thumbs.db
