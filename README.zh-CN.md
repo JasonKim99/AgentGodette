@@ -1,12 +1,18 @@
-<img width="1672" height="941" alt="ChatGPT Image 2026年4月22日 06_27_35" src="https://github.com/user-attachments/assets/501fa074-759c-41fa-966c-e3ea2377f468" />
+<div align="center">
 
-封面灵感来自 Agent 47。
+<img width="720" alt="Agent Godette 封面" src="https://github.com/user-attachments/assets/501fa074-759c-41fa-966c-e3ea2377f468" />
+
+<sub>封面灵感来自 Agent 47。</sub>
 
 [English](README.md) | 简体中文
 
-# Agent Godette (v0.4.0)
+# Agent Godette
 
-![License](https://img.shields.io/badge/license-MIT-green) ![Node.js](https://img.shields.io/badge/Node.js-18+-brightgreen?logo=nodedotjs&logoColor=white) ![ACP](https://img.shields.io/badge/protocol-ACP-8b5cf6)
+### Godot 编辑器内的 ACP Agent
+
+![License](https://img.shields.io/badge/license-MIT-green) ![Node.js](https://img.shields.io/badge/Node.js-18+-brightgreen?logo=nodedotjs&logoColor=white) ![ACP](https://img.shields.io/badge/protocol-ACP-8b5cf6) ![Version](https://img.shields.io/badge/version-0.4.0-blue)
+
+</div>
 
 **每个会话独立切换模型、模式、推理等级** —— 在 composer 底栏直接切换模型、推理强度、权限模式，每个 thread 各自为政。
 

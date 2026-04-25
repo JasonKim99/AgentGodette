@@ -1,12 +1,18 @@
-<img width="1672" height="941" alt="ChatGPT Image 2026年4月22日 06_27_35" src="https://github.com/user-attachments/assets/501fa074-759c-41fa-966c-e3ea2377f468" />
+<div align="center">
 
-Cover art inspired by Agent 47.
+<img width="720" alt="Agent Godette cover" src="https://github.com/user-attachments/assets/501fa074-759c-41fa-966c-e3ea2377f468" />
+
+<sub>Cover art inspired by Agent 47.</sub>
 
 English | [简体中文](README.zh-CN.md)
 
-# Agent Godette (v0.4.0)
+# Agent Godette
 
-![License](https://img.shields.io/badge/license-MIT-green) ![Node.js](https://img.shields.io/badge/Node.js-18+-brightgreen?logo=nodedotjs&logoColor=white) ![ACP](https://img.shields.io/badge/protocol-ACP-8b5cf6)
+### ACP Agent in the Godot Editor
+
+![License](https://img.shields.io/badge/license-MIT-green) ![Node.js](https://img.shields.io/badge/Node.js-18+-brightgreen?logo=nodedotjs&logoColor=white) ![ACP](https://img.shields.io/badge/protocol-ACP-8b5cf6) ![Version](https://img.shields.io/badge/version-0.4.0-blue)
+
+</div>
 
 **Per-session model, mode, and reasoning** — switch model, reasoning effort, and permission mode per thread, right from the composer bar.
 
