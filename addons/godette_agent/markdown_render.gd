@@ -47,6 +47,7 @@ extends RefCounted
 const TextBlockScript = preload("res://addons/godette_agent/text_block.gd")
 const SelectionScript = preload("res://addons/godette_agent/markdown_selection_manager.gd")
 const ListBlockScript = preload("res://addons/godette_agent/list_block.gd")
+const TableBlockScript = preload("res://addons/godette_agent/table_block.gd")
 
 # Heading sizes are deltas added to the caller's base_font_size, mirroring
 # the proportions browsers use (h1 ~1.6x, h2 ~1.4x, down to h6 = body).
@@ -240,6 +241,7 @@ static func _handle_start(ev: Dictionary, stack: Array, ctx: Dictionary) -> void
 			)
 			list_block.set_font_size(int(ctx["base_font_size"]))
 			list_block.set_line_spacing(float(ctx["line_spacing"]))
+			list_block.set_selection_color(ctx["selection_color"])
 			list_block.set_ordered(bool(ev.get("ordered", false)))
 
 			var indent := MarginContainer.new()
@@ -247,6 +249,13 @@ static func _handle_start(ev: Dictionary, stack: Array, ctx: Dictionary) -> void
 			indent.add_theme_constant_override("margin_left", LIST_INDENT)
 			indent.add_child(list_block)
 			_current_container(stack).add_child(indent)
+
+			# Wire ListBlock into the cross-block selection manager. The
+			# `indent` MarginContainer is the hit_area: it spans the full
+			# row including the LIST_INDENT gutter on the left, so a drag
+			# passing through that left margin still registers as "on this
+			# list" instead of falling between blocks.
+			_register_with_hit_area(list_block, indent, ctx)
 
 			stack.append({
 				"tag": tag,
@@ -264,110 +273,67 @@ static func _handle_start(ev: Dictionary, stack: Array, ctx: Dictionary) -> void
 			stack.append({"tag": tag, "container": null, "text_target": null})
 
 		"table":
-			# Outer PanelContainer gives the grid its visible border; the
-			# inner GridContainer lays out cells row-major. h/v separation
-			# is zero so adjacent cells share their borders (painted on
-			# each cell's right+bottom edges in the table_cell branch).
+			# Route 3: single GodetteTableBlock self-draws the entire grid
+			# (N×M cells, header bg, borders, GFM alignment). Replaces the
+			# previous PanelContainer + GridContainer + per-cell
+			# (PanelContainer + MarginContainer + TextBlock) tree, which
+			# was 4·N·M+2 Controls per table — the last big source of
+			# VirtualFeed measure-drift.
 			var alignments: Array = ev.get("alignments", [])
-			var grid_wrap := PanelContainer.new()
-			grid_wrap.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-			var tbl_style := StyleBoxFlat.new()
-			tbl_style.bg_color = Color(0, 0, 0, 0)
-			tbl_style.border_color = ctx["rule_color"]
-			tbl_style.set_border_width_all(1)
-			tbl_style.set_corner_radius_all(3)
-			grid_wrap.add_theme_stylebox_override("panel", tbl_style)
-			var grid := GridContainer.new()
-			grid.columns = max(1, alignments.size())
-			grid.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-			grid.add_theme_constant_override("h_separation", 0)
-			grid.add_theme_constant_override("v_separation", 0)
-			grid_wrap.add_child(grid)
-			_current_container(stack).add_child(grid_wrap)
+			var table_block: GodetteTableBlock = TableBlockScript.new()
+			table_block.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+			table_block.set_color(ctx["fg"])
+			table_block.set_fonts(
+				null,
+				ctx["font_bold"],
+				ctx["font_italic"],
+				ctx["font_bold_italic"],
+				ctx["font_mono"]
+			)
+			table_block.set_font_size(int(ctx["base_font_size"]))
+			table_block.set_line_spacing(float(ctx["line_spacing"]))
+			table_block.set_selection_color(ctx["selection_color"])
+			table_block.set_border_color(ctx["rule_color"])
+			table_block.set_header_bg(ctx["code_bg"])
+			table_block.set_columns(max(1, alignments.size()), alignments)
+			_current_container(stack).add_child(table_block)
+			# Register with the selection manager. The block itself is the
+			# hit area — it covers the whole table rect including the
+			# outer border so a drag passing through the border still
+			# registers as "on this table."
+			_register_with_hit_area(table_block, null, ctx)
 			stack.append({
 				"tag": tag,
-				"container": grid,
+				"container": table_block,
 				"text_target": null,
-				"alignments": alignments,
+				"table_block": table_block,
 			})
 
 		"table_row":
-			# State-only frame. No Control of its own; the grid lays cells
-			# out row-major and column boundaries fall out of
-			# grid.columns * n_cells. col_index resets to 0 per row so
-			# table_cell can pick the right alignment from `alignments`.
+			# State-only frame. The TableBlock owns the row data via its
+			# begin_row/end_row API; we just notify it here. Walk back to
+			# find the enclosing table_block reference.
+			var tb_row_v = _enclosing_table_block(stack)
+			if tb_row_v != null:
+				tb_row_v.begin_row(bool(ev.get("is_header", false)))
 			stack.append({
 				"tag": tag,
 				"container": null,
 				"text_target": null,
 				"is_header": bool(ev.get("is_header", false)),
-				"col_index": 0,
 			})
 
 		"table_cell":
-			var table_frame: Dictionary = {}
-			var row_frame: Dictionary = {}
-			for i in range(stack.size() - 1, -1, -1):
-				var f: Dictionary = stack[i]
-				if f.get("tag", "") == "table_row" and row_frame.is_empty():
-					row_frame = f
-				elif f.get("tag", "") == "table":
-					table_frame = f
-					break
-			if table_frame.is_empty() or row_frame.is_empty():
-				# Orphan cell — emit a tombstone so the stack depth stays
-				# balanced with the matching `end` event. Anything appended
-				# inside won't render because text_target is null.
+			var tb_cell_v = _enclosing_table_block(stack)
+			if tb_cell_v == null:
+				# Orphan cell — push tombstone so the stack stays balanced.
 				stack.append({"tag": "table_cell", "container": null, "text_target": null})
 				return
-			var is_header: bool = bool(row_frame.get("is_header", false))
-			var cell_bg := PanelContainer.new()
-			cell_bg.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-			var cell_style := StyleBoxFlat.new()
-			cell_style.bg_color = Color(0, 0, 0, 0)
-			if is_header:
-				# Header row gets a subtle bg tint; reuses the inline-code
-				# chip colour since both express "this content is
-				# structural, not a sentence."
-				cell_style.bg_color = ctx["code_bg"]
-			cell_style.border_color = ctx["rule_color"]
-			# Right + bottom borders only — adjacent cells share edges so
-			# doubling would make every internal grid line 2 px wide.
-			cell_style.border_width_right = 1
-			cell_style.border_width_bottom = 1
-			cell_bg.add_theme_stylebox_override("panel", cell_style)
-			var cell_pad := MarginContainer.new()
-			cell_pad.add_theme_constant_override("margin_left", 8)
-			cell_pad.add_theme_constant_override("margin_right", 8)
-			cell_pad.add_theme_constant_override("margin_top", 4)
-			cell_pad.add_theme_constant_override("margin_bottom", 4)
-			cell_bg.add_child(cell_pad)
-			# We register this TextBlock with the selection manager manually
-			# (selectable=false to skip the default auto-register) so we can
-			# pass `cell_bg` as the hit area. The cell's SHRINK_CENTER on the
-			# TextBlock leaves whitespace above/below inside the grid cell;
-			# without the larger hit_area the drag search can't find this
-			# cell when the cursor is over that padding.
-			var tb := _make_textblock(ctx, false)
-			tb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-			# SHRINK_CENTER vertically so a short cell dropped into a tall row
-			# (the Grid forces every cell in a row to the tallest cell's
-			# height) ends up with its text centred rather than anchored to
-			# the top, leaving an awkward block of whitespace below. Tall
-			# cells still fill their own row height because the text itself
-			# provides the min_y.
-			tb.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-			if is_header:
-				tb.set_font(ctx["font_bold"])
-			cell_pad.add_child(tb)
-			_register_with_hit_area(tb, cell_bg, ctx)
-			var grid: Control = table_frame.get("container")
-			if grid != null:
-				grid.add_child(cell_bg)
-			# Advance the row's column pointer so subsequent cells see the
-			# next column index.
-			row_frame["col_index"] = int(row_frame.get("col_index", 0)) + 1
-			stack.append({"tag": tag, "container": cell_pad, "text_target": tb})
+			tb_cell_v.begin_cell()
+			# text_target = the table_block itself; its append_span /
+			# append_text route into the currently-building cell. End is
+			# triggered by the matching "end" event in `_handle_end`.
+			stack.append({"tag": tag, "container": null, "text_target": tb_cell_v})
 
 		_:
 			# Unknown tag — push a stub frame so the matching `end` still
@@ -390,7 +356,29 @@ static func _handle_end(ev: Dictionary, stack: Array) -> void:
 		var lb_v = enclosing.get("list_block", null)
 		if lb_v != null and is_instance_valid(lb_v) and lb_v.has_method("end_item"):
 			lb_v.end_item()
+	# Route 3 (tables): notify the enclosing TableBlock of cell / row
+	# completion so it can flush its incremental builder state.
+	if expected == "table_cell":
+		var tb_cell = _enclosing_table_block(stack)
+		if tb_cell != null and tb_cell.has_method("end_cell"):
+			tb_cell.end_cell()
+	elif expected == "table_row":
+		var tb_row = _enclosing_table_block(stack)
+		if tb_row != null and tb_row.has_method("end_row"):
+			tb_row.end_row()
 	stack.pop_back()
+
+
+# Walk the stack from top to find the nearest TableBlock reference. Stops
+# at the table frame's `table_block` slot. Used by both _handle_start
+# (during table_row / table_cell open) and _handle_end (cell/row close).
+static func _enclosing_table_block(stack: Array):
+	for i in range(stack.size() - 1, -1, -1):
+		var f = stack[i] as Dictionary
+		var tb_v = f.get("table_block", null)
+		if tb_v != null and is_instance_valid(tb_v):
+			return tb_v
+	return null
 
 
 static func _handle_text(ev: Dictionary, stack: Array, ctx: Dictionary) -> void:
@@ -418,6 +406,12 @@ static func _handle_text(ev: Dictionary, stack: Array, ctx: Dictionary) -> void:
 			# note); we don't paint a separate link colour in v1.
 			opts["font"] = ctx["font_italic"]
 			opts["bg"] = ctx["link_bg"]
+			# Stash the href on the span so the block can resolve a
+			# left-click into a URL open. Empty string = not a link
+			# (no-op when read by `_link_at_char`).
+			var href: String = str(ev.get("href", ""))
+			if not href.is_empty():
+				opts["href"] = href
 		_:
 			pass
 	target.append_span(text, opts)

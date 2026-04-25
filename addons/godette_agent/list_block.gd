@@ -78,6 +78,15 @@ var _sel_focus_char: int = -1
 var _selecting: bool = false
 var _selection_color: Color = Color(0.28, 0.42, 0.78, 0.45)
 
+# Cross-block selection coordinator. When non-null, the markdown selection
+# manager has registered this ListBlock as a sibling of any TextBlocks in
+# the same message tree. ListBlock then exposes its multi-item selection
+# as a *flat* character coordinate (items joined by an imaginary `\n`)
+# so the manager can talk to all blocks in the same int-char vocabulary.
+# When null, we fall back to self-driven drag (used by tests / standalone
+# previews where no manager exists).
+var _selection_manager: Object = null
+
 # Multi-click detection (matches TextBlock).
 const _MULTI_CLICK_WINDOW_SEC: float = 0.45
 const _MULTI_CLICK_TOLERANCE_PX: float = 4.0
@@ -181,6 +190,18 @@ func set_line_spacing(value: float) -> void:
 	_line_spacing = value
 	_dirty = true
 	_sync_paragraphs()
+	queue_redraw()
+
+
+# Selection highlight color. The default is a sensible navy-ish blue, but
+# the markdown renderer drives it from the editor theme so ListBlocks
+# match TextBlocks in the same message — without this setter, the two
+# block types painted selection in subtly different blues and the user
+# saw a banded effect when dragging across them.
+func set_selection_color(value: Color) -> void:
+	if value == _selection_color:
+		return
+	_selection_color = value
 	queue_redraw()
 
 
@@ -305,7 +326,7 @@ func _draw_selection_rects() -> void:
 			span_end = _item_full_text(i).length()
 		if span_end <= span_start:
 			continue
-		_draw_paragraph_range_rect(p, span_start, span_end, _selection_color, item_y)
+		_draw_paragraph_selection_rect(p, span_start, span_end, _selection_color, item_y)
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +400,69 @@ func _draw_paragraph_range_rect(paragraph: TextParagraph, s: int, e: int, color:
 		var rect := Rect2(
 			Vector2(_content_x + start_x - pad_x, item_y_top + y_cursor),
 			Vector2(end_x - start_x + pad_x * 2.0, line_size.y),
+		)
+		draw_rect(rect, color)
+		y_cursor += row_advance
+
+
+# Filled selection rect over character range [s, e) within `paragraph`.
+# Mirrors text_block.gd's `_draw_selection_rects` (not `_draw_range_rect`).
+# The split matters because chip drawing (inline code, link bg) wants
+# tight glyph-hugging rects, while selection drawing needs:
+#   1. Snap to `line_size.x` whenever the range either continues past the
+#      line OR ends exactly at line_end. The latter case is critical:
+#      `_line_char_x_local` for the last char of a wrapped line can come
+#      back as a degenerate Rect2 at x=0 (notably when the line ends in
+#      a bold span — `shaped_text_get_carets` collapses caret rects in
+#      certain shaping configurations). Without this snap the rect's
+#      `end_x <= start_x` check fires and the whole line's selection
+#      highlight disappears, which read as "wrapped continuation lines
+#      are missing from the selection" in the multi-item drag bug.
+#   2. Use `row_advance` (line height + line_spacing) for inner lines so
+#      adjacent wraps abut without a hairline gap. The last line of an
+#      item caps at `line_size.y` so the highlight doesn't bleed into
+#      the ITEM_GAP_PX gutter below.
+#   3. No `pad_x` — selection rects don't extend past the glyphs (chips
+#      do, intentionally).
+func _draw_paragraph_selection_rect(paragraph: TextParagraph, s: int, e: int, color: Color, item_y_top: float) -> void:
+	if e <= s or paragraph == null:
+		return
+	var line_count: int = paragraph.get_line_count()
+	var y_cursor: float = 0.0
+	for line_idx in range(line_count):
+		var line_range: Vector2i = paragraph.get_line_range(line_idx)
+		var line_size: Vector2 = paragraph.get_line_size(line_idx)
+		var row_advance: float = line_size.y + _line_spacing
+		var line_start: int = line_range.x
+		var line_end: int = line_range.y  # exclusive
+		if line_end <= s or line_start >= e:
+			y_cursor += row_advance
+			continue
+		var overlap_start: int = max(s, line_start)
+		var overlap_end: int = min(e, line_end)
+		var line_rid: RID = paragraph.get_line_rid(line_idx)
+		var continues_to_next_line: bool = e > line_end
+		var start_x: float
+		if overlap_start == line_start:
+			start_x = 0.0
+		else:
+			start_x = _line_char_x_local(line_rid, overlap_start - line_start, line_size.x, false)
+		var end_x: float
+		if continues_to_next_line or overlap_end == line_end:
+			end_x = line_size.x
+		else:
+			end_x = _line_char_x_local(line_rid, overlap_end - line_start, line_size.x, true)
+		if end_x <= start_x:
+			y_cursor += row_advance
+			continue
+		# Inner lines (wraps) extend to row_advance so adjacent rects
+		# abut. Last line of the paragraph caps at line_size.y so the
+		# highlight doesn't bleed into the ITEM_GAP_PX gutter below this
+		# item.
+		var rect_h: float = row_advance if line_idx < line_count - 1 else line_size.y
+		var rect := Rect2(
+			Vector2(_content_x + start_x, item_y_top + y_cursor),
+			Vector2(end_x - start_x, rect_h),
 		)
 		draw_rect(rect, color)
 		y_cursor += row_advance
@@ -637,6 +721,157 @@ func get_selected_text() -> String:
 	return "\n".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Selection — cross-block manager protocol
+# ---------------------------------------------------------------------------
+#
+# These are the methods markdown_selection_manager expects every
+# registered block to implement. ListBlock differs from TextBlock in that
+# it owns N text runs (items) rather than 1 — but the manager talks in
+# flat int-char positions, so we expose a flat coordinate space here that
+# concatenates items with a `\n` between each pair (matching what
+# `get_text()` and `get_selected_text()` return).
+
+
+func register_selection_manager(manager: Object) -> void:
+	# Nullable; passing null detaches.
+	_selection_manager = manager
+
+
+# Like `clear_selection()` but suppresses the `selection_changed` signal.
+# The manager wipes every non-active block on each drag-frame; emitting
+# N signals per frame would be a real hot-spot during drag.
+func clear_selection_silent() -> void:
+	if _sel_anchor_item == -1 and _sel_focus_item == -1:
+		return
+	_sel_anchor_item = -1
+	_sel_anchor_char = -1
+	_sel_focus_item = -1
+	_sel_focus_char = -1
+	_selecting = false
+	queue_redraw()
+
+
+# Manager calls this with two flat indices when a drag motion lands inside
+# this block (the start_idx == end_idx case in `_apply_selection`). Order
+# is anchor-then-focus, so a < b means "drag forward", a > b means
+# "drag backward". Both are clamped via `_flat_to_pair` so out-of-range
+# values are safe.
+func select_range(a: int, b: int) -> void:
+	var pa: Dictionary = _flat_to_pair(a)
+	var pb: Dictionary = _flat_to_pair(b)
+	_sel_anchor_item = pa["item"]
+	_sel_anchor_char = pa["char"]
+	_sel_focus_item = pb["item"]
+	_sel_focus_char = pb["char"]
+	queue_redraw()
+
+
+# Drag began in this block, focus moved to a block below: select from
+# `start_char` (flat) through the end of our content.
+func select_from_char(start_char: int) -> void:
+	if _items_spans.is_empty():
+		_sel_anchor_item = -1
+		_sel_focus_item = -1
+		return
+	var p: Dictionary = _flat_to_pair(start_char)
+	_sel_anchor_item = p["item"]
+	_sel_anchor_char = p["char"]
+	var last_item: int = _items_spans.size() - 1
+	_sel_focus_item = last_item
+	_sel_focus_char = _item_full_text(last_item).length()
+	queue_redraw()
+
+
+# Drag focus landed in this block, anchor is in a block above: select from
+# the start of our content through `end_char` (flat).
+func select_to_char(end_char: int) -> void:
+	if _items_spans.is_empty():
+		_sel_anchor_item = -1
+		_sel_focus_item = -1
+		return
+	_sel_anchor_item = 0
+	_sel_anchor_char = 0
+	var p: Dictionary = _flat_to_pair(end_char)
+	_sel_focus_item = p["item"]
+	_sel_focus_char = p["char"]
+	queue_redraw()
+
+
+# Block is fully covered by a multi-block selection.
+func select_all() -> void:
+	if _items_spans.is_empty():
+		return
+	_sel_anchor_item = 0
+	_sel_anchor_char = 0
+	var last_item: int = _items_spans.size() - 1
+	_sel_focus_item = last_item
+	_sel_focus_char = _item_full_text(last_item).length()
+	queue_redraw()
+
+
+func get_selection_anchor() -> int:
+	if _sel_anchor_item < 0:
+		return -1
+	return _flat_char_for(_sel_anchor_item, _sel_anchor_char)
+
+
+func get_selection_caret() -> int:
+	if _sel_focus_item < 0:
+		return -1
+	return _flat_char_for(_sel_focus_item, _sel_focus_char)
+
+
+# Full block text in the same flat coordinate space the manager works
+# in: items joined by `\n`. Used by the manager for two purposes —
+# `select_to_char(text.length())` to clamp the final char, and to know
+# when a block is empty so it can be skipped during drag.
+func get_text() -> String:
+	if _items_spans.is_empty():
+		return ""
+	var parts := PackedStringArray()
+	for i in range(_items_spans.size()):
+		parts.append(_item_full_text(i))
+	return "\n".join(parts)
+
+
+# Manager-facing hit test: in → ListBlock-local position, out → flat char.
+# Wraps the existing item/char hit-test plus the flat-char conversion so
+# the manager doesn't need to know about our per-item layout.
+func hit_test_char(local_pos: Vector2) -> int:
+	var hit: Dictionary = _hit_test_position(local_pos)
+	if hit.is_empty():
+		return 0
+	return _flat_char_for(hit["item"], hit["char"])
+
+
+# ---------------------------------------------------------------------------
+# Flat-char ↔ (item, char) bidirection
+# ---------------------------------------------------------------------------
+
+
+# Convert a flat char index into (item_idx, char_in_item). Items are
+# separated by 1 imaginary `\n` each (matches `get_text()`'s join). A flat
+# value that lands on the boundary between item i and item i+1 maps to
+# (i, len(item_i)) — i.e. the end of item i, not the start of item i+1.
+# Both representations select the same content, but choosing end-of-prev
+# is consistent with how flat values for "end of item i" come back from
+# `_flat_char_for(i, len(item_i))`.
+func _flat_to_pair(flat: int) -> Dictionary:
+	if _items_spans.is_empty():
+		return {"item": 0, "char": 0}
+	var f: int = max(0, flat)
+	var cursor: int = 0
+	for i in range(_items_spans.size()):
+		var item_len: int = _item_full_text(i).length()
+		if f <= cursor + item_len:
+			return {"item": i, "char": clamp(f - cursor, 0, item_len)}
+		cursor += item_len + 1  # +1 for the joining \n
+	# Past every item — clamp to end of last.
+	var last_idx: int = _items_spans.size() - 1
+	return {"item": last_idx, "char": _item_full_text(last_idx).length()}
+
+
 # Walk the spans of an item to recover its concatenated text. Cheap —
 # spans are already in memory.
 func _item_full_text(item_idx: int) -> String:
@@ -882,8 +1117,14 @@ func _gui_input(event: InputEvent) -> void:
 			_last_click_time_sec = now
 			_last_click_pos = mb.position
 
+			var has_manager: bool = (
+				_selection_manager != null and is_instance_valid(_selection_manager)
+			)
+
 			if mb.shift_pressed and _sel_anchor_item >= 0:
 				# Shift-click: keep existing anchor, move focus to the click.
+				# Stays local even with a manager — extension within this
+				# block doesn't need cross-block coordination.
 				_sel_focus_item = hit["item"]
 				_sel_focus_char = hit["char"]
 				_selecting = true
@@ -900,24 +1141,69 @@ func _gui_input(event: InputEvent) -> void:
 					_select_line_at(hit["item"])
 					_selecting = false
 				_:
-					# Plain click: collapse to a caret at the click position
-					# and arm drag tracking.
+					# Plain click: collapse to a caret at the click position.
+					# Self-driven drag tracking (process+_input mouse-up) is
+					# armed only when no manager is registered. With a
+					# manager, drag motion + mouse-up are owned by it
+					# (see markdown_selection_manager._input) and we'd
+					# otherwise end up double-handling motion plus emitting
+					# duplicated selection_changed signals.
 					_sel_anchor_item = hit["item"]
 					_sel_anchor_char = hit["char"]
 					_sel_focus_item = hit["item"]
 					_sel_focus_char = hit["char"]
-					_selecting = true
-					_begin_drag_tracking()
+					if has_manager:
+						_selecting = false
+					else:
+						_selecting = true
+						_begin_drag_tracking()
 			queue_redraw()
 			emit_signal("selection_changed")
-			# Hook for cross-block selection manager (Step 3). Emit the
-			# anchor as a flat char index so the manager can coordinate
-			# with sibling blocks. Computing the flat index now avoids
-			# the manager having to know about ListBlock's per-item
-			# layout.
+			# Hand off to the cross-block manager. The flat char encodes
+			# (item, char) so the manager can compare positions with
+			# TextBlocks in the same message. For multi-click cases the
+			# manager re-reads our anchor/caret via has_selection() →
+			# get_selection_anchor() / get_selection_caret(), so the word/
+			# line range we just set survives the hand-off.
 			emit_signal("selection_drag_started", _flat_char_for(hit["item"], hit["char"]))
 		else:
+			# Mouse-up: detect a "click without drag" on a link span and
+			# route to OS.shell_open. Same conditions as TextBlock — see
+			# the matching block there for the rationale. Selection stops
+			# the link open so dragging across a link still selects.
+			var moved: bool = mb.position.distance_to(_last_click_pos) > _MULTI_CLICK_TOLERANCE_PX
+			var has_sel: bool = (
+				_sel_anchor_item != _sel_focus_item
+				or _sel_anchor_char != _sel_focus_char
+			)
 			_end_drag()
+			if not moved and not has_sel:
+				var release_hit := _hit_test_position(mb.position)
+				if not release_hit.is_empty():
+					var href: String = _link_at(release_hit["item"], release_hit["char"])
+					if not href.is_empty():
+						if href.begins_with("http://") or href.begins_with("https://"):
+							OS.shell_open(href)
+
+
+# Walks the spans of `item_idx` to find which span contains `char_in_item`
+# and returns its `href` field if any. Mirrors TextBlock's `_link_at_char`,
+# scoped to one item's span list. Returns "" for non-link characters.
+func _link_at(item_idx: int, char_in_item: int) -> String:
+	if item_idx < 0 or item_idx >= _items_spans.size() or char_in_item < 0:
+		return ""
+	var spans: Array = _items_spans[item_idx]
+	var cursor: int = 0
+	for span_v in spans:
+		var span: Dictionary = span_v
+		var span_text: String = str(span.get("text", ""))
+		var span_len: int = span_text.length()
+		if span_len <= 0:
+			continue
+		if char_in_item >= cursor and char_in_item < cursor + span_len:
+			return str(span.get("href", ""))
+		cursor += span_len
+	return ""
 
 
 # Convert (item, char_in_item) into a single flat char index across the

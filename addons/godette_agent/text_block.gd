@@ -391,6 +391,11 @@ func _normalize_span(span: Dictionary) -> Dictionary:
 		out["font_size"] = fs
 	if span.get("bg") is Color:
 		out["bg"] = span["bg"]
+	# href is the only metadata key — kept under the same span dict so
+	# the click resolver can walk spans the same way span-bg drawing does.
+	var href := str(span.get("href", ""))
+	if not href.is_empty():
+		out["href"] = href
 	return out
 
 
@@ -852,7 +857,26 @@ func _gui_input(event: InputEvent) -> void:
 				queue_redraw()
 				emit_signal("selection_changed")
 			else:
+				# Mouse-up: detect a "click without drag" on a link span
+				# and route to OS.shell_open. The conditions:
+				#   - cursor didn't move past the multi-click tolerance
+				#     (any larger move = user dragged → selection mode,
+				#      not a link click)
+				#   - no extended selection at this point (anchor==caret
+				#     means we're still on the original collapse-caret
+				#     state from the press; double/triple click and shift
+				#     extension both leave anchor != caret here)
+				# Any movement OR any selection blocks the link open, so
+				# dragging *over* a link still works as text selection.
+				var moved: bool = mb.position.distance_to(_last_click_pos) > MULTI_CLICK_TOLERANCE_PX
+				var still_caret: bool = _selection_anchor == _selection_caret
 				_end_drag()
+				if not moved and still_caret:
+					var release_char: int = _hit_test_char(mb.position)
+					var href: String = _link_at_char(release_char)
+					if not href.is_empty():
+						if href.begins_with("http://") or href.begins_with("https://"):
+							OS.shell_open(href)
 			return
 
 
@@ -995,6 +1019,28 @@ func _forward_wheel_to_scroll(mb: InputEventMouseButton) -> void:
 			scroll.scroll_horizontal = scroll.scroll_horizontal - step
 		MOUSE_BUTTON_WHEEL_RIGHT:
 			scroll.scroll_horizontal = scroll.scroll_horizontal + step
+
+
+# Walks the span list to find which span contains `char_idx` and returns
+# its `href` field if any. Returns empty string for non-link characters
+# (the fallback the click handler interprets as "not a link"). Same
+# linear-walk pattern `_draw_span_backgrounds` uses for chip drawing —
+# span counts per block are small (single digits) so the cost is
+# negligible per click.
+func _link_at_char(char_idx: int) -> String:
+	if char_idx < 0:
+		return ""
+	var cursor: int = 0
+	for span_v in _spans:
+		var span: Dictionary = span_v
+		var span_text: String = str(span.get("text", ""))
+		var span_len: int = span_text.length()
+		if span_len <= 0:
+			continue
+		if char_idx >= cursor and char_idx < cursor + span_len:
+			return str(span.get("href", ""))
+		cursor += span_len
+	return ""
 
 
 func _hit_test_char(local_pos: Vector2) -> int:

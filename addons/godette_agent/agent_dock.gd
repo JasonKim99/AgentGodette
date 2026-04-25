@@ -2562,10 +2562,17 @@ func _on_user_bubble_meta_clicked(meta: Variant, segments: Array) -> void:
 func _attach_assistant_block_right_click(root: Control, entry_index: int) -> void:
 	if root == null:
 		return
-	if root is GodetteTextBlock:
-		var tb: GodetteTextBlock = root
-		tb.set_meta("entry_index", entry_index)
-		tb.right_clicked.connect(Callable(self, "_on_assistant_block_right_clicked").bind(tb))
+	# Duck-typed: any Control that exposes the (right_clicked, get_selected_text)
+	# protocol participates. Originally this was a strict `is GodetteTextBlock`
+	# check; ListBlock and TableBlock now ride the same contract so the
+	# context menu works on lists and tables too without a per-class branch
+	# here. New block types only need to implement the protocol — no edit
+	# to this recursion required.
+	if root.has_signal("right_clicked") and root.has_method("get_selected_text"):
+		root.set_meta("entry_index", entry_index)
+		var cb := Callable(self, "_on_assistant_block_right_clicked").bind(root)
+		if not root.right_clicked.is_connected(cb):
+			root.right_clicked.connect(cb)
 	for child in root.get_children():
 		if child is Control:
 			_attach_assistant_block_right_click(child, entry_index)
@@ -2637,7 +2644,7 @@ func _is_assistant_entry_streaming(entry_index: int) -> bool:
 	return false
 
 
-func _on_assistant_block_right_clicked(_local_pos: Vector2, source: GodetteTextBlock) -> void:
+func _on_assistant_block_right_clicked(_local_pos: Vector2, source: Control) -> void:
 	if not is_instance_valid(source):
 		return
 	var entry_index: int = int(source.get_meta("entry_index", -1))
@@ -2652,8 +2659,8 @@ func _show_assistant_context_menu(entry_index: int, source: Control) -> void:
 	popup.id_pressed.connect(Callable(self, "_on_assistant_context_menu_id_pressed").bind(entry_index, source, popup))
 
 	var selected_text := ""
-	if source is GodetteTextBlock:
-		selected_text = (source as GodetteTextBlock).get_selected_text()
+	if is_instance_valid(source) and source.has_method("get_selected_text"):
+		selected_text = str(source.get_selected_text())
 	var id_copy_selection := 1
 	popup.add_item(GodetteI18n.t("Copy Selection"), id_copy_selection)
 	popup.set_item_disabled(popup.get_item_count() - 1, selected_text.is_empty())
@@ -2681,8 +2688,8 @@ func _cleanup_context_popup(popup: PopupMenu) -> void:
 func _on_assistant_context_menu_id_pressed(id: int, entry_index: int, source: Control, popup: PopupMenu) -> void:
 	match id:
 		1:
-			if source is GodetteTextBlock:
-				var selected: String = (source as GodetteTextBlock).get_selected_text()
+			if is_instance_valid(source) and source.has_method("get_selected_text"):
+				var selected: String = str(source.get_selected_text())
 				if not selected.is_empty():
 					DisplayServer.clipboard_set(selected)
 		2:
