@@ -99,7 +99,7 @@ const ZH_CN: Dictionary = {
 	"Current: %s": "进行中:%s",
 	"All Done": "全部完成",
 	"Needs approval": "需要授权",
-	"No focus": "未选择节点",
+	"No focus": "无焦点",
 	"Show less ⌃": "收起 ⌃",
 	"Show full command ⌄": "展开完整命令 ⌄",
 	"Raw Input:": "原始输入:",
@@ -121,12 +121,30 @@ static func is_zh_cn() -> bool:
 	# would stay on English for the rest of the session.
 	if not Engine.is_editor_hint():
 		return false
+	var locale: String = ""
+	# Primary: explicit editor language setting. Empty when the user
+	# hasn't picked a language (Godot's "auto" / system-default mode).
 	var settings: EditorSettings = EditorInterface.get_editor_settings()
-	if settings == null:
-		return false
-	var locale: String = str(settings.get_setting("interface/editor/editor_language"))
-	var result: bool = locale == "zh_CN"
-	_is_zh_cn_cached = 1 if result else 0
+	if settings != null:
+		locale = str(settings.get_setting("interface/editor/editor_language"))
+	# Fallback: OS locale. Covers users who never touched the editor
+	# language dropdown but run a Chinese OS — the editor displays in
+	# Chinese anyway, so we should match.
+	# Godot stores "use system default" as the literal string "auto",
+	# not an empty value, so we treat both as "no explicit choice".
+	if locale.is_empty() or locale == "auto":
+		locale = OS.get_locale()
+	# Accept variants: "zh_CN", "zh_CN.UTF-8", "zh-CN", "zh_CN_GB", etc.
+	# Explicitly excludes zh_TW / zh-TW so Traditional Chinese stays on
+	# the English fallback (matches the "non-Simplified Chinese → English"
+	# requirement).
+	var normalised: String = locale.replace("-", "_")
+	var result: bool = normalised.begins_with("zh_CN")
+	# Only cache when we actually have a definitive answer. If both the
+	# editor setting and OS locale came up empty, we don't cache so a
+	# later call after EditorInterface is fully ready can re-detect.
+	if not locale.is_empty():
+		_is_zh_cn_cached = 1 if result else 0
 	return result
 
 
