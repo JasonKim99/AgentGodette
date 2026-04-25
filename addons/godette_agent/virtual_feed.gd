@@ -368,7 +368,23 @@ func _ensure_cumulative_y() -> void:
 	var running: float = 0.0
 	for i in range(_entries.size()):
 		_ordered_y[i] = running
-		var h: float = _heights[i]
+		var h: float = -1.0
+		# For materialized entries, the live control's `size.y` is the
+		# authoritative source — that's literally what gets rendered. The
+		# `_heights[i]` cache can drift behind reality when a Container
+		# subtree re-lays-out without bubbling `minimum_size_changed` up
+		# to our outer signal, causing the cumulative_y math to place the
+		# next entry inside this one (the visible "overlap" symptom).
+		# Reading from the control directly closes that gap and also
+		# refreshes the cache so dematerialization later has the right
+		# fallback value.
+		if _controls.has(i):
+			var ctrl_variant: Variant = _controls[i]
+			if ctrl_variant is Control and is_instance_valid(ctrl_variant):
+				h = (ctrl_variant as Control).size.y
+				_heights[i] = h
+		if h < 0.0:
+			h = _heights[i]
 		if h < 0.0:
 			h = _estimated_row_height
 		running += h
@@ -622,6 +638,22 @@ func _remeasure_visible() -> void:
 
 
 func _reposition_visible_controls() -> void:
+	# First normalise widths — this can itself cascade Container
+	# layouts that change `size.y` of materialized controls.
+	for key in _controls.keys():
+		var idx: int = int(key)
+		var ctrl: Control = _controls[idx]
+		if not is_instance_valid(ctrl):
+			continue
+		if not is_equal_approx(ctrl.size.x, size.x):
+			ctrl.size.x = size.x
+	# Force cumulative_y to rebuild using the live `ctrl.size.y` of
+	# materialized entries (see `_ensure_cumulative_y`). Without
+	# `_ordered_y_dirty = true` here the rebuild is skipped when sizes
+	# changed externally without going through `_measure_entry` (which
+	# is the only path that normally marks the cache dirty), and stale
+	# positions cause the visible "entries glued together" overlap.
+	_ordered_y_dirty = true
 	_ensure_cumulative_y()
 	for key in _controls.keys():
 		var idx: int = int(key)
@@ -629,8 +661,6 @@ func _reposition_visible_controls() -> void:
 		if not is_instance_valid(ctrl):
 			continue
 		ctrl.position = Vector2(0.0, _ordered_y[idx])
-		if not is_equal_approx(ctrl.size.x, size.x):
-			ctrl.size.x = size.x
 
 
 func _free_control(entry_index: int) -> void:
