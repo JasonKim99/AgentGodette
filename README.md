@@ -4,7 +4,7 @@ Cover art inspired by Agent 47.
 
 English | [简体中文](README.zh-CN.md)
 
-# Agent Godette (v0.3.3)
+# Agent Godette (v0.4.0)
 
 ![License](https://img.shields.io/badge/license-MIT-green) ![Node.js](https://img.shields.io/badge/Node.js-18+-brightgreen?logo=nodedotjs&logoColor=white) ![ACP](https://img.shields.io/badge/protocol-ACP-8b5cf6)
 
