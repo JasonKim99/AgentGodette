@@ -10,11 +10,11 @@
 
 **每个会话独立切换模型、模式、推理等级** —— 在 composer 底栏直接切换模型、推理强度、权限模式，每个 thread 各自为政。
 
-<img width="3840" height="2076" alt="Per-session model selector" src="https://raw.githubusercontent.com/JasonKim99/AgentGodette/master/addons/godette_agent/docs/model_select.png" />
+<img width="3840" height="2076" alt="Per-session model selector" src="https://raw.githubusercontent.com/JasonKim99/AgentGodette/master/git_src/model_select.png" />
 
 **Plan · Queue · 场景节点焦点** —— agent 的 TodoWrite 计划面板折叠在 composer 上方，排队中的后续 prompt 夹在计划和输入框之间，在 SceneTree 里选中的任何节点会作为隐式上下文自动附加到发送中。
 
-<img width="3840" height="2076" alt="Plan drawer, Queue drawer, and SceneTree focus indicator" src="https://raw.githubusercontent.com/JasonKim99/AgentGodette/master/addons/godette_agent/docs/plan+queue+selectnode.png" />
+<img width="3840" height="2076" alt="Plan drawer, Queue drawer, and SceneTree focus indicator" src="https://raw.githubusercontent.com/JasonKim99/AgentGodette/master/git_src/plan+queue+selectnode.png" />
 
 
 ## 是什么

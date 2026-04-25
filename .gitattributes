@@ -1,2 +1,14 @@
-# Normalize EOL for all files that Git considers text files.
+# Normalize line endings for all files that Git considers text files.
 * text=auto eol=lf
+
+# Only include the addons folder when downloading from the Asset Library.
+# Asset Library generates downloads via `git archive`, which honours
+# `export-ignore`. This strips:
+#   - vendor/         (full Zed source kept for reference)
+#   - git_src/        (README screenshots + Asset Library cover icon —
+#                      repo-only assets, see git_src/.gdignore)
+#   - top-level docs  (README, LICENSE in repo root, etc.)
+# so end users only get the plugin payload under addons/.
+/**        export-ignore
+/addons    !export-ignore
+/addons/** !export-ignore

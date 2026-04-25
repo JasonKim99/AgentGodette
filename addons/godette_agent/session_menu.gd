@@ -201,7 +201,7 @@ func _build_row(session_index: int, context: Dictionary, delete_icon: Texture2D)
 	delete_btn.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
 	delete_btn.mouse_filter = Control.MOUSE_FILTER_PASS
 	delete_btn.custom_minimum_size = Vector2(22, 22)
-	delete_btn.tooltip_text = "Delete this thread"
+	delete_btn.tooltip_text = GodetteI18n.t("Delete this thread")
 	if delete_icon != null:
 		delete_btn.icon = delete_icon
 	delete_btn.visible = false

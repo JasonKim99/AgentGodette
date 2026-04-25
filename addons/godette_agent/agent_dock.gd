@@ -471,7 +471,7 @@ func _build_ui() -> void:
 	add_child(session_popup)
 
 	status_label = Label.new()
-	status_label.text = "Starting..."
+	status_label.text = GodetteI18n.t("Starting...")
 	status_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
 	status_label.clip_text = true
 	status_label.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
@@ -485,7 +485,7 @@ func _build_ui() -> void:
 	thread_switcher_button = Button.new()
 	thread_switcher_button.flat = true
 	thread_switcher_button.focus_mode = Control.FOCUS_NONE
-	thread_switcher_button.tooltip_text = "Switch thread"
+	thread_switcher_button.tooltip_text = GodetteI18n.t("Switch thread")
 	thread_switcher_button.icon = HISTORY_ICON
 	_apply_icon_button_theme(thread_switcher_button, HEADER_AGENT_ICON_SIZE)
 	thread_switcher_button.pressed.connect(Callable(self, "_on_thread_switcher_pressed"))
@@ -769,7 +769,7 @@ func _build_ui() -> void:
 	send_button = Button.new()
 	send_button.text = ""
 	send_button.icon = SEND_ICON
-	send_button.tooltip_text = "Send"
+	send_button.tooltip_text = GodetteI18n.t("Send")
 	send_button.custom_minimum_size = Vector2(52, 40)
 	_apply_icon_button_theme(send_button, HEADER_AGENT_ICON_SIZE)
 	send_button.pressed.connect(Callable(self, "_on_send_button_pressed"))
@@ -1618,11 +1618,11 @@ func _build_tool_call_inline(entry: Dictionary) -> Control:
 		body_indent.add_child(body_col)
 
 		if has_raw_input:
-			body_col.add_child(_make_tool_section_label("Raw Input:", muted_color))
+			body_col.add_child(_make_tool_section_label(GodetteI18n.t("Raw Input:"), muted_color))
 			body_col.add_child(_make_tool_code_card(raw_input_text))
 
 		if has_output:
-			body_col.add_child(_make_tool_section_label("Output:", muted_color))
+			body_col.add_child(_make_tool_section_label(GodetteI18n.t("Output:"), muted_color))
 			var output_key: String = expand_key + "|full" if not expand_key.is_empty() else ""
 			var show_full: bool = not output_key.is_empty() and expanded_tool_calls.has(output_key)
 			var is_long: bool = _is_long_tool_content(summary_text)
@@ -1791,7 +1791,7 @@ func _build_tool_call_card(entry: Dictionary, awaiting_permission: bool) -> Cont
 	# stays as a chip because it's user-actionable, not just state.
 	if awaiting_permission:
 		var approval_chip := Label.new()
-		approval_chip.text = "Needs approval"
+		approval_chip.text = GodetteI18n.t("Needs approval")
 		approval_chip.modulate = Color(0.98, 0.86, 0.52, 0.92)
 		header_row.add_child(approval_chip)
 
@@ -1866,7 +1866,7 @@ func _make_show_more_toggle(is_expanded: bool, expand_key: String) -> Control:
 	button.focus_mode = Control.FOCUS_NONE
 	button.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
 	button.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
-	button.text = "Show less ⌃" if is_expanded else "Show full command ⌄"
+	button.text = GodetteI18n.t("Show less ⌃") if is_expanded else GodetteI18n.t("Show full command ⌄")
 	button.modulate = _editor_color("font_readonly_color", "Editor", Color(0.7, 0.7, 0.8, 0.85))
 	button.pressed.connect(Callable(self, "_on_tool_call_show_more_pressed").bind(expand_key))
 	return button
@@ -1944,7 +1944,7 @@ func _make_disclosure_chevron(is_open: bool) -> Button:
 	button.focus_mode = Control.FOCUS_NONE
 	button.custom_minimum_size = Vector2(22, 22)
 	button.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
-	button.tooltip_text = "Collapse" if is_open else "Expand"
+	button.tooltip_text = GodetteI18n.t("Collapse") if is_open else GodetteI18n.t("Expand")
 	# Prefer the editor's own tree-disclosure icons so the glyph lines
 	# up with neighbouring Label baselines. Unicode carets (⌃ / ⌄) used
 	# to drift vertically because their metrics don't share the Label
@@ -2191,9 +2191,13 @@ func _make_copy_button(text_to_copy: String, tooltip_label: String = "Copy") -> 
 	button.custom_minimum_size = Vector2(22, 22)
 	button.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
 	button.text = "⧉"
-	button.tooltip_text = tooltip_label
+	# Translate at the tooltip boundary. Callers pass English labels
+	# (defaults to "Copy" / custom like "Copy Command"); translating
+	# here keeps every call site clean of localization details.
+	var localized_tooltip: String = GodetteI18n.t(tooltip_label)
+	button.tooltip_text = localized_tooltip
 	button.set_meta("copy_text", text_to_copy)
-	button.set_meta("copy_tooltip", tooltip_label)
+	button.set_meta("copy_tooltip", localized_tooltip)
 	button.pressed.connect(Callable(self, "_on_copy_button_pressed").bind(button))
 	return button
 
@@ -2206,7 +2210,7 @@ func _on_copy_button_pressed(button: Button) -> void:
 		return
 	DisplayServer.clipboard_set(text_to_copy)
 	button.text = "✓"
-	button.tooltip_text = "Copied!"
+	button.tooltip_text = GodetteI18n.t("Copied!")
 	button.modulate = Color(0.72, 0.94, 0.78, 1.0)
 	var tree := get_tree()
 	if tree == null:
@@ -2267,7 +2271,7 @@ func _build_thinking_entry(entry: Dictionary, entry_index: int = -1) -> Control:
 	content.add_child(header_row)
 
 	var title_label := Label.new()
-	title_label.text = "Thinking"
+	title_label.text = GodetteI18n.t("Thinking")
 	title_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	title_label.modulate = Color(0.82, 0.82, 0.92, 0.78)
 	header_row.add_child(title_label)
@@ -2569,9 +2573,9 @@ func _on_user_block_right_clicked(_local_pos: Vector2, source: GodetteTextBlock)
 	var full_text: String = source.get_text()
 	var ID_COPY_SELECTION := 1
 	var ID_COPY_MESSAGE := 2
-	popup.add_item("Copy Selection", ID_COPY_SELECTION)
+	popup.add_item(GodetteI18n.t("Copy Selection"), ID_COPY_SELECTION)
 	popup.set_item_disabled(popup.get_item_count() - 1, selected_text.is_empty())
-	popup.add_item("Copy Message", ID_COPY_MESSAGE)
+	popup.add_item(GodetteI18n.t("Copy Message"), ID_COPY_MESSAGE)
 	popup.set_item_disabled(popup.get_item_count() - 1, full_text.is_empty())
 
 	popup.id_pressed.connect(func(id: int) -> void:
@@ -2624,18 +2628,18 @@ func _show_assistant_context_menu(entry_index: int, source: Control) -> void:
 	if source is GodetteTextBlock:
 		selected_text = (source as GodetteTextBlock).get_selected_text()
 	var id_copy_selection := 1
-	popup.add_item("Copy Selection", id_copy_selection)
+	popup.add_item(GodetteI18n.t("Copy Selection"), id_copy_selection)
 	popup.set_item_disabled(popup.get_item_count() - 1, selected_text.is_empty())
 
-	popup.add_item("Copy This Agent Response", 2)
+	popup.add_item(GodetteI18n.t("Copy This Agent Response"), 2)
 
 	popup.add_separator()
 
 	var at_top: bool = message_scroll != null and message_scroll.scroll_vertical <= 0
 	if at_top:
-		popup.add_item("Scroll to Bottom", 3)
+		popup.add_item(GodetteI18n.t("Scroll to Bottom"), 3)
 	else:
-		popup.add_item("Scroll to Top", 4)
+		popup.add_item(GodetteI18n.t("Scroll to Top"), 4)
 
 	popup.reset_size()
 	popup.position = DisplayServer.mouse_get_position()
@@ -2711,13 +2715,17 @@ func _scroll_feed_to_top() -> void:
 func _stream_entry_title(entry: Dictionary, kind: String) -> String:
 	match kind:
 		"user":
-			return "You"
+			return GodetteI18n.t("You")
 		"assistant":
 			return _safe_text(str(entry.get("speaker", _agent_label(_current_agent_id()))))
 		"tool":
-			return _safe_text(str(entry.get("title", "Tool")))
+			return _safe_text(str(entry.get("title", GodetteI18n.t("Tool"))))
 		_:
-			return _safe_text(str(entry.get("speaker", "System")))
+			# Speaker field stores English identifiers like "System";
+			# localize on render so the transcript stays locale-agnostic
+			# on disk.
+			var raw: String = str(entry.get("speaker", "System"))
+			return _safe_text(GodetteI18n.t(raw))
 
 
 func _stream_entry_summary(entry: Dictionary, kind: String) -> String:
@@ -2961,20 +2969,20 @@ func _refresh_plan_drawer() -> void:
 	title_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
 	title_label.clip_text = true
 	if is_expanded:
-		title_label.text = "Plan"
+		title_label.text = GodetteI18n.t("Plan")
 	else:
 		var current_task: String = _plan_current_task_text(plan_entries)
-		title_label.text = ("Current: %s" % current_task) if not current_task.is_empty() else "Plan"
+		title_label.text = (GodetteI18n.t("Current: %s") % current_task) if not current_task.is_empty() else GodetteI18n.t("Plan")
 	header_row.add_child(title_label)
 
 	var count_label := Label.new()
 	count_label.modulate = Color(0.91, 0.91, 0.96, 0.66)
 	if all_done:
-		count_label.text = "All Done"
+		count_label.text = GodetteI18n.t("All Done")
 	elif is_expanded:
 		count_label.text = _plan_progress_label(plan_entries)
 	else:
-		count_label.text = "%d left" % _plan_remaining_count(plan_entries)
+		count_label.text = GodetteI18n.t_plan_left(_plan_remaining_count(plan_entries))
 	header_row.add_child(count_label)
 
 	var close_button := _make_plan_close_button()
@@ -3070,7 +3078,7 @@ func _refresh_queue_drawer() -> void:
 	var title_label := Label.new()
 	title_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	title_label.modulate = _editor_color("font_color", "Editor", Color(0.95, 0.95, 1.0, 1.0))
-	title_label.text = "%d Queued Message%s" % [queue.size(), "" if queue.size() == 1 else "s"]
+	title_label.text = GodetteI18n.t_queue_count(queue.size())
 	title_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
 	title_label.clip_text = true
 	header_row.add_child(title_label)
@@ -3079,8 +3087,8 @@ func _refresh_queue_drawer() -> void:
 	clear_all.flat = true
 	clear_all.focus_mode = Control.FOCUS_NONE
 	clear_all.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
-	clear_all.text = "Clear All"
-	clear_all.tooltip_text = "Drop every queued prompt"
+	clear_all.text = GodetteI18n.t("Clear All")
+	clear_all.tooltip_text = GodetteI18n.t("Drop every queued prompt")
 	clear_all.modulate = Color(1.0, 1.0, 1.0, 0.75)
 	clear_all.pressed.connect(Callable(self, "_on_queue_clear_all_pressed"))
 	header_row.add_child(clear_all)
@@ -3121,7 +3129,7 @@ func _build_queue_entry_row(entry: Dictionary, index: int) -> Control:
 	dot.custom_minimum_size = Vector2(10, 10)
 	dot.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	dot.add_theme_stylebox_override("panel", _queue_dot_style(is_next))
-	dot.tooltip_text = "Next in Queue" if is_next else "In Queue"
+	dot.tooltip_text = GodetteI18n.t("Next in Queue") if is_next else GodetteI18n.t("In Queue")
 	row.add_child(dot)
 
 	var preview_label := Label.new()
@@ -3177,8 +3185,8 @@ func _make_queue_send_now_button(is_next: bool) -> Button:
 	var button := Button.new()
 	button.focus_mode = Control.FOCUS_NONE
 	button.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
-	button.text = "Send Now"
-	button.tooltip_text = "Send this queued message immediately"
+	button.text = GodetteI18n.t("Send Now")
+	button.tooltip_text = GodetteI18n.t("Send this queued message immediately")
 	if is_next:
 		# Outlined — accent border, transparent bg, so it stands out
 		# against the drawer surface.
@@ -3496,7 +3504,7 @@ func _make_plan_close_button() -> Button:
 	button.focus_mode = Control.FOCUS_NONE
 	button.flat = true
 	button.custom_minimum_size = Vector2(20, 20)
-	button.tooltip_text = "Dismiss plan"
+	button.tooltip_text = GodetteI18n.t("Dismiss plan")
 	button.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
 	# Slightly muted until hovered, matching the chevron button's affordance
 	# so the two controls read as a paired toolbar rather than one shouting
@@ -3795,7 +3803,7 @@ func _send_prompt() -> void:
 	# to empty in get_plain_text(), so this matters.
 	var attachments := _session_attachments(current_session_index)
 	if prompt.is_empty() and attachments.is_empty():
-		_append_system_message("Write a prompt first.")
+		_append_system_message(GodetteI18n.t("Write a prompt first."))
 		return
 
 	var session: Dictionary = sessions[current_session_index]
@@ -3926,7 +3934,7 @@ func _dispatch_next_prompt(session_index: int) -> void:
 		session["queued_prompts"] = queue
 		session["busy"] = false
 		sessions[session_index] = session
-		_append_transcript_to_session(session_index, "System", "Couldn't send the prompt to the local ACP adapter.")
+		_append_transcript_to_session(session_index, "System", GodetteI18n.t("Couldn't send the prompt to the local ACP adapter."))
 		_refresh_send_state()
 		_refresh_status()
 		# busy just flipped false — let the now-ungated debounce run.
@@ -4016,7 +4024,7 @@ func _ensure_connection(agent_id: String):
 		connection_status[agent_id] = "offline"
 		connections.erase(agent_id)
 		connection.queue_free()
-		_append_system_message_to_agent(agent_id, "Couldn't launch the local ACP adapter for %s." % _agent_label(agent_id))
+		_append_system_message_to_agent(agent_id, GodetteI18n.t("Couldn't launch the local ACP adapter for %s.") % _agent_label(agent_id))
 		_refresh_status()
 		return null
 
@@ -4099,7 +4107,7 @@ func _flush_pending_session_creates(agent_id: String) -> void:
 		if connection.create_session(str(session.get("id", "")), project_root) < 0:
 			session["creating_remote_session"] = false
 			sessions[session_index] = session
-			_append_transcript_to_session(session_index, "System", "Couldn't create the remote ACP session.")
+			_append_transcript_to_session(session_index, "System", GodetteI18n.t("Couldn't create the remote ACP session."))
 
 
 func _flush_pending_session_loads(agent_id: String) -> void:
@@ -4132,7 +4140,7 @@ func _flush_pending_session_loads(agent_id: String) -> void:
 			session["loading_remote_session"] = false
 			sessions[session_index] = session
 			replaying_sessions.erase(replay_key)
-			_append_transcript_to_session(session_index, "System", "Couldn't load the existing remote ACP session.")
+			_append_transcript_to_session(session_index, "System", GodetteI18n.t("Couldn't load the existing remote ACP session."))
 
 
 func _adapter_candidates(agent_id: String) -> Array:
@@ -4276,9 +4284,9 @@ func _on_connection_session_load_failed(agent_id: String, local_session_id: Stri
 	if _is_resource_missing_error(error_message):
 		var title: String = str(session.get("title", remote_session_id))
 		_evict_session(session_index)
-		_append_system_message_to_agent(agent_id, "Session \"%s\" no longer exists on %s; removing from local history." % [title, _agent_label(agent_id)])
+		_append_system_message_to_agent(agent_id, GodetteI18n.t("Session \"%s\" no longer exists on %s; removing from local history.") % [title, _agent_label(agent_id)])
 	else:
-		_append_transcript_to_session(session_index, "System", "Couldn't load this session: %s" % error_message)
+		_append_transcript_to_session(session_index, "System", GodetteI18n.t("Couldn't load this session: %s") % error_message)
 
 	_refresh_send_state()
 	_refresh_status()
@@ -4287,7 +4295,7 @@ func _on_connection_session_load_failed(agent_id: String, local_session_id: Stri
 func _on_connection_session_create_failed(agent_id: String, local_session_id: String, _error_code: int, error_message: String) -> void:
 	var session_index: int = _find_session_index_by_id(local_session_id)
 	if session_index < 0:
-		_append_system_message_to_agent(agent_id, "Couldn't create a new session: %s" % error_message)
+		_append_system_message_to_agent(agent_id, GodetteI18n.t("Couldn't create a new session: %s") % error_message)
 		return
 
 	var session: Dictionary = sessions[session_index]
@@ -4295,7 +4303,7 @@ func _on_connection_session_create_failed(agent_id: String, local_session_id: St
 	session["loading_remote_session"] = false
 	sessions[session_index] = session
 
-	_append_transcript_to_session(session_index, "System", "Couldn't create this session: %s" % error_message)
+	_append_transcript_to_session(session_index, "System", GodetteI18n.t("Couldn't create this session: %s") % error_message)
 	_refresh_send_state()
 	_refresh_status()
 
@@ -4448,7 +4456,7 @@ func _on_connection_prompt_finished(agent_id: String, remote_session_id: String,
 	# (max_tokens hits, adapter errors, etc).
 	var stop_reason := str(result.get("stopReason", "done"))
 	if stop_reason != "end_turn" and stop_reason != "cancelled" and stop_reason != "done":
-		_append_transcript_to_session(session_index, "System", "%s finished with %s." % [_agent_label(agent_id), stop_reason])
+		_append_transcript_to_session(session_index, "System", GodetteI18n.t("%s finished with %s.") % [_agent_label(agent_id), stop_reason])
 
 	# Release any un-revealed smoothing buffer so the final state shows
 	# immediately instead of trickling over another 200ms.
@@ -4739,7 +4747,7 @@ func attach_current_scene() -> void:
 
 	var root := editor_interface.get_edited_scene_root()
 	if root == null:
-		_append_system_message("No edited scene is open.")
+		_append_system_message(GodetteI18n.t("No edited scene is open."))
 		return
 
 	var current_attachments := _session_attachments(current_session_index)
@@ -4747,7 +4755,7 @@ func attach_current_scene() -> void:
 	var label := scene_path if not scene_path.is_empty() else root.name
 	var key := "scene:%s" % label
 	if _attachments_has_key(current_attachments, key):
-		_append_system_message("Current scene is already attached.")
+		_append_system_message(GodetteI18n.t("Current scene is already attached."))
 		return
 
 	var scene_attachment := {
@@ -4876,12 +4884,12 @@ func _on_composer_image_pasted(image: Image) -> void:
 	var path := PASTED_IMAGE_DIR + filename
 	var save_err := image.save_png(path)
 	if save_err != OK:
-		_append_system_message("Couldn't save pasted image: error %d" % save_err)
+		_append_system_message(GodetteI18n.t("Couldn't save pasted image: error %d") % save_err)
 		return
 	var saved_bytes := FileAccess.get_file_as_bytes(path).size()
 	if saved_bytes > MAX_IMAGE_BYTES:
 		DirAccess.remove_absolute(path)
-		_append_system_message("Pasted image is too large (%d bytes) — try a smaller screenshot." % saved_bytes)
+		_append_system_message(GodetteI18n.t("Pasted image is too large (%d bytes) — try a smaller screenshot.") % saved_bytes)
 		return
 
 	var key := "image:%s" % path
@@ -5057,9 +5065,9 @@ func _refresh_focus_indicator() -> void:
 		var eye_closed := _editor_theme_icon("GuiVisibilityHidden")
 		focus_eye_button.icon = eye_open if focus_include_enabled else eye_closed
 		focus_eye_button.tooltip_text = (
-			"Focus node is INCLUDED in the next prompt — click to ignore"
+			GodetteI18n.t("Focus node is INCLUDED in the next prompt — click to ignore")
 			if focus_include_enabled
-			else "Focus node is IGNORED — click to include in the next prompt"
+			else GodetteI18n.t("Focus node is IGNORED — click to include in the next prompt")
 		)
 
 	var selection = editor_interface.get_selection() if editor_interface != null else null
@@ -5072,8 +5080,8 @@ func _refresh_focus_indicator() -> void:
 		# flip the include-preference even before picking a node.
 		focus_selected_node = null
 		focus_icon_rect.texture = _editor_theme_icon("Node")
-		focus_path_label.text = "No focus"
-		focus_path_label.tooltip_text = "Select a node in the Scene Tree to attach it as context"
+		focus_path_label.text = GodetteI18n.t("No focus")
+		focus_path_label.tooltip_text = GodetteI18n.t("Select a node in the Scene Tree to attach it as context")
 		focus_indicator_container.modulate = Color(1, 1, 1, 0.45)
 		focus_indicator_container.set_active(false)
 		return
@@ -5098,7 +5106,7 @@ func _refresh_focus_indicator() -> void:
 	var relative_path: String = "."
 	if scene_root != null and primary != scene_root and scene_root.is_ancestor_of(primary):
 		relative_path = str(scene_root.get_path_to(primary))
-	focus_path_label.tooltip_text = "%s  ·  %s\nEye toggle decides whether this node is included in the next prompt." % [relative_path, primary.get_class()]
+	focus_path_label.tooltip_text = GodetteI18n.t("%s  ·  %s\nEye toggle decides whether this node is included in the next prompt.") % [relative_path, primary.get_class()]
 
 	# Icon: use editor-theme class icon for the node (Node2D / Button /
 	# CollisionShape3D, etc), falling back to the generic Node glyph.
@@ -5448,7 +5456,7 @@ func _build_session_popup_groups() -> Array:
 
 	var recent_indices: Array = _recent_session_indices(RECENT_SESSION_LIMIT)
 	var listed: Dictionary = {}
-	var recent_group: Dictionary = {"header": "Recently Updated", "indices": []}
+	var recent_group: Dictionary = {"header": GodetteI18n.t("Recently Updated"), "indices": []}
 	for session_index_variant in recent_indices:
 		var session_index: int = int(session_index_variant)
 		recent_group["indices"].append(session_index)
@@ -5457,7 +5465,7 @@ func _build_session_popup_groups() -> Array:
 		groups.append(recent_group)
 
 	if sessions.size() > recent_indices.size():
-		var all_group: Dictionary = {"header": "All Sessions", "indices": []}
+		var all_group: Dictionary = {"header": GodetteI18n.t("All Sessions"), "indices": []}
 		for session_index in range(sessions.size()):
 			if listed.has(session_index):
 				continue
@@ -5518,12 +5526,12 @@ func _refresh_add_menu() -> void:
 
 	var popup := add_menu.get_popup()
 	popup.clear()
-	popup.add_item("External Agents", -1)
+	popup.add_item(GodetteI18n.t("External Agents"), -1)
 	popup.set_item_disabled(popup.get_item_count() - 1, true)
 	for index in range(AGENTS.size()):
 		popup.add_item(str(AGENTS[index]["label"]), ADD_MENU_AGENT_ID_OFFSET + index)
 	popup.add_separator()
-	popup.add_item("Add More Agents", -1)
+	popup.add_item(GodetteI18n.t("Add More Agents"), -1)
 	popup.set_item_disabled(popup.get_item_count() - 1, true)
 	add_menu.icon = ADD_ICON
 
@@ -5959,7 +5967,7 @@ func _refresh_send_state() -> void:
 	if current_session_index < 0:
 		send_button.disabled = true
 		send_button.icon = SEND_ICON
-		send_button.tooltip_text = "Send"
+		send_button.tooltip_text = GodetteI18n.t("Send")
 		_refresh_queue_indicator()
 		return
 
@@ -5976,13 +5984,13 @@ func _refresh_send_state() -> void:
 	if busy:
 		if has_content:
 			send_button.icon = QUEUE_ICON
-			send_button.tooltip_text = "Queue this prompt — sends when the current turn ends"
+			send_button.tooltip_text = GodetteI18n.t("Queue this prompt — sends when the current turn ends")
 		else:
 			send_button.icon = STOP_ICON
-			send_button.tooltip_text = "Stop"
+			send_button.tooltip_text = GodetteI18n.t("Stop")
 	else:
 		send_button.icon = SEND_ICON
-		send_button.tooltip_text = "Send"
+		send_button.tooltip_text = GodetteI18n.t("Send")
 	send_button.disabled = cancelling
 	_refresh_queue_indicator()
 
@@ -6033,77 +6041,86 @@ func _refresh_status() -> void:
 
 	_refresh_loading_scanner()
 
+	# `status_key` stays in English as an internal state identifier;
+	# `GodetteI18n.t(status_key)` localises for display. Keeping the
+	# English key is important for the "hide when Ready" comparison at
+	# the bottom — can't branch on a localized string.
 	if current_session_index < 0:
-		status_label.text = "No session"
+		var no_session_text: String = GodetteI18n.t("No session")
+		status_label.text = no_session_text
 		status_label.visible = true
 		if thread_icon != null:
 			thread_icon.texture = null
 		if status_dot != null:
 			status_dot.add_theme_stylebox_override("panel", _status_dot_style(Color(0.46, 0.48, 0.52, 0.85)))
-			status_dot.tooltip_text = "No session"
+			status_dot.tooltip_text = no_session_text
 		return
 
 	var session: Dictionary = sessions[current_session_index]
 	var agent_id: String = str(session.get("agent_id", DEFAULT_AGENT_ID))
 	var status: String = str(connection_status.get(agent_id, "starting"))
-	var status_text := "Connecting"
+	var status_key := "Connecting"
 	var dot_color := Color(0.81, 0.66, 0.27, 0.95)
 
 	if thread_icon != null:
 		thread_icon.texture = _agent_icon_texture(agent_id)
 
 	if bool(session.get("busy", false)):
-		status_text = "Stopping" if bool(session.get("cancelling", false)) else "Working"
+		status_key = "Stopping" if bool(session.get("cancelling", false)) else "Working"
 		dot_color = Color(0.83, 0.69, 0.29, 0.95)
-		status_label.text = status_text
+		var busy_text := GodetteI18n.t(status_key)
+		status_label.text = busy_text
 		status_label.visible = true
 		if status_dot != null:
 			status_dot.add_theme_stylebox_override("panel", _status_dot_style(dot_color))
-			status_dot.tooltip_text = status_text
+			status_dot.tooltip_text = busy_text
 		return
 
 	if bool(session.get("creating_remote_session", false)):
-		status_text = "Opening"
+		status_key = "Opening"
 		dot_color = Color(0.81, 0.66, 0.27, 0.95)
-		status_label.text = status_text
+		var opening_text := GodetteI18n.t(status_key)
+		status_label.text = opening_text
 		status_label.visible = true
 		if status_dot != null:
 			status_dot.add_theme_stylebox_override("panel", _status_dot_style(dot_color))
-			status_dot.tooltip_text = status_text
+			status_dot.tooltip_text = opening_text
 		return
 
 	if bool(session.get("loading_remote_session", false)):
-		status_text = "Loading"
+		status_key = "Loading"
 		dot_color = Color(0.81, 0.66, 0.27, 0.95)
-		status_label.text = status_text
+		var loading_text := GodetteI18n.t(status_key)
+		status_label.text = loading_text
 		status_label.visible = true
 		if status_dot != null:
 			status_dot.add_theme_stylebox_override("panel", _status_dot_style(dot_color))
-			status_dot.tooltip_text = status_text
+			status_dot.tooltip_text = loading_text
 		return
 
 	match status:
 		"ready":
-			status_text = "Ready"
+			status_key = "Ready"
 			dot_color = Color(0.34, 0.82, 0.47, 0.98)
 		"starting":
-			status_text = "Connecting"
+			status_key = "Connecting"
 			dot_color = Color(0.81, 0.66, 0.27, 0.95)
 		"error":
-			status_text = "Error"
+			status_key = "Error"
 			dot_color = Color(0.89, 0.37, 0.38, 0.98)
 		"offline":
-			status_text = "Offline"
+			status_key = "Offline"
 			dot_color = Color(0.52, 0.54, 0.58, 0.95)
 		_:
-			status_text = status.capitalize()
+			status_key = status.capitalize()
 			dot_color = Color(0.58, 0.60, 0.64, 0.95)
 
-	status_label.text = status_text
-	status_label.visible = status_text != "Ready"
+	var display_text := GodetteI18n.t(status_key)
+	status_label.text = display_text
+	status_label.visible = status_key != "Ready"
 	if status_dot != null:
 		status_dot.add_theme_stylebox_override("panel", _status_dot_style(dot_color))
-		status_dot.tooltip_text = status_text
+		status_dot.tooltip_text = display_text
 
 
 func _update_prompt_placeholder() -> void:
@@ -6117,7 +6134,7 @@ func _prompt_placeholder(agent_id: String) -> String:
 	# Keep the placeholder honest: promising `@` / `/` pickers that don't
 	# exist was listed as a direct disconnect in TODO.md P0 #2. Re-add the
 	# hints only once the pickers ship so new users aren't misled.
-	return "Message %s..." % _agent_label(agent_id)
+	return GodetteI18n.t("Message %s...") % _agent_label(agent_id)
 
 
 func _on_config_menu_id_pressed(item_id: int, popup: PopupMenu, config_id: String) -> void:

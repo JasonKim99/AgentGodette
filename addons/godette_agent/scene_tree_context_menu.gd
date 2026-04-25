@@ -12,7 +12,7 @@ func _popup_menu(paths: PackedStringArray) -> void:
 	if paths.is_empty():
 		return
 
-	add_context_menu_item("Ask Agent About Nodes", Callable(self, "_on_context_selected"))
+	add_context_menu_item(GodetteI18n.t("Ask Agent About Nodes"), Callable(self, "_on_context_selected"))
 
 
 func _on_context_selected(nodes: Array) -> void:

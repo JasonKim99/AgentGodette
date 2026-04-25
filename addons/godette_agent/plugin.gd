@@ -22,11 +22,12 @@ func _enter_tree() -> void:
 	scene_tree_context_menu = SceneTreeContextMenuScript.new(dock)
 	add_context_menu_plugin(EditorContextMenuPlugin.CONTEXT_SLOT_SCENE_TREE, scene_tree_context_menu)
 
-	add_tool_menu_item("Agent Godette: Focus Dock", Callable(self, "_focus_agent_dock"))
+	add_tool_menu_item(GodetteI18n.t("Agent Godette: Focus Dock"), Callable(self, "_focus_agent_dock"))
 
 
 func _exit_tree() -> void:
-	remove_tool_menu_item("Agent Godette: Focus Dock")
+	# Must use the same string that was registered — localize identically.
+	remove_tool_menu_item(GodetteI18n.t("Agent Godette: Focus Dock"))
 
 	if filesystem_context_menu != null:
 		remove_context_menu_plugin(filesystem_context_menu)

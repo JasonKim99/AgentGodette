@@ -250,16 +250,16 @@ func _build_tooltip_control(meta: Dictionary) -> Control:
 			var scene_path := str(payload.get("scene_path", ""))
 			if scene_path.is_empty():
 				scene_path = str(meta.get("label", ""))
-			vbox.add_child(_dim_label("Scene"))
+			vbox.add_child(_dim_label(GodetteI18n.t("Scene")))
 			vbox.add_child(_path_label(scene_path))
 		"node":
 			var relative_path := str(payload.get("relative_node_path", ""))
 			var scene_parent := str(payload.get("scene_path", ""))
 			if not relative_path.is_empty():
-				vbox.add_child(_dim_label("Node"))
+				vbox.add_child(_dim_label(GodetteI18n.t("Node")))
 				vbox.add_child(_path_label(relative_path))
 			if not scene_parent.is_empty():
-				vbox.add_child(_dim_label("in %s" % scene_parent))
+				vbox.add_child(_dim_label(GodetteI18n.t("in %s") % scene_parent))
 		_:
 			var fallback := str(meta.get("tooltip", meta.get("label", "")))
 			if not fallback.is_empty():
