@@ -48,6 +48,7 @@ const TextBlockScript = preload("res://addons/godette_agent/text_block.gd")
 const SelectionScript = preload("res://addons/godette_agent/markdown_selection_manager.gd")
 const ListBlockScript = preload("res://addons/godette_agent/list_block.gd")
 const TableBlockScript = preload("res://addons/godette_agent/table_block.gd")
+const CodeBlockScript = preload("res://addons/godette_agent/code_block_block.gd")
 
 # Heading sizes are deltas added to the caller's base_font_size, mirroring
 # the proportions browsers use (h1 ~1.6x, h2 ~1.4x, down to h6 = body).
@@ -209,23 +210,31 @@ static func _handle_start(ev: Dictionary, stack: Array, ctx: Dictionary) -> void
 			stack.append({"tag": tag, "container": row, "text_target": tb})
 
 		"code_block":
-			var panel := PanelContainer.new()
-			panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-			var style := StyleBoxFlat.new()
-			style.bg_color = ctx["code_block_bg"]
-			style.set_corner_radius_all(4)
-			panel.add_theme_stylebox_override("panel", style)
-			var pad := MarginContainer.new()
-			pad.add_theme_constant_override("margin_left", CODE_PAD_X)
-			pad.add_theme_constant_override("margin_right", CODE_PAD_X)
-			pad.add_theme_constant_override("margin_top", CODE_PAD_Y)
-			pad.add_theme_constant_override("margin_bottom", CODE_PAD_Y)
-			panel.add_child(pad)
-			var tb := _make_textblock(ctx)
-			tb.set_font(ctx["font_mono"])
-			pad.add_child(tb)
-			_current_container(stack).add_child(panel)
-			stack.append({"tag": tag, "container": panel, "text_target": tb})
+			# Route 3: GodetteCodeBlockBlock self-draws bg + per-token
+			# colours via Godot's built-in GDScriptSyntaxHighlighter (so
+			# the colours match the user's editor theme automatically).
+			# Replaces the legacy PanelContainer + MarginContainer +
+			# TextBlock tree (3 controls per code block).
+			var code_block: GodetteCodeBlockBlock = CodeBlockScript.new()
+			code_block.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+			code_block.set_font(ctx["font_mono"])
+			code_block.set_font_size(int(ctx["base_font_size"]))
+			code_block.set_color(ctx["fg"])
+			code_block.set_bg_color(ctx["code_block_bg"])
+			code_block.set_selection_color(ctx["selection_color"])
+			code_block.set_language(str(ev.get("language", "")))
+			_current_container(stack).add_child(code_block)
+			_register_with_hit_area(code_block, null, ctx)
+			# text_target is the block itself; its append_text /
+			# append_span concat into the internal buffer. The matching
+			# `end` event in `_handle_end` triggers `finalize()` which
+			# tokenises + builds the per-token TextLines.
+			stack.append({
+				"tag": tag,
+				"container": code_block,
+				"text_target": code_block,
+				"code_block": code_block,
+			})
 
 		"list":
 			# Route 3 PoC re-enabled for swap-bug diagnostic.
@@ -366,6 +375,13 @@ static func _handle_end(ev: Dictionary, stack: Array) -> void:
 		var tb_row = _enclosing_table_block(stack)
 		if tb_row != null and tb_row.has_method("end_row"):
 			tb_row.end_row()
+	# Route 3 (code block): finalise tokenisation now that the fence is
+	# closed and the full text is in the block's buffer.
+	if expected == "code_block":
+		var top_frame: Dictionary = stack[stack.size() - 1]
+		var cb_v = top_frame.get("code_block", null)
+		if cb_v != null and is_instance_valid(cb_v) and cb_v.has_method("finalize"):
+			cb_v.finalize()
 	stack.pop_back()
 
 

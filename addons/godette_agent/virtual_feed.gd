@@ -28,6 +28,14 @@ signal entry_freed(entry_index: int, control: Control)
 
 const DEFAULT_ESTIMATED_ROW_HEIGHT := 60.0
 const DEFAULT_OVERSCAN_ROWS := 3
+# Empty padding reported below the last entry so its bottom doesn't sit
+# flush against the ScrollContainer viewport bottom. Gives in-block
+# affordances (CodeBlockBlock chevron footer, Tool-call card buttons,
+# etc.) breathing room when the user is scrolled to the end of the
+# transcript — without it, an entry whose footer lands exactly at the
+# scroll max can have its chevron pinned to the viewport edge or
+# clipped by 1-2 px of subpixel rounding.
+const BOTTOM_PADDING_PX := 60.0
 
 var _entries: Array = []
 var _heights: PackedFloat32Array = PackedFloat32Array()
@@ -553,8 +561,14 @@ func _flush_virtual_height() -> void:
 	_ensure_cumulative_y()
 	var total: float = _ordered_y[_entries.size()] if not _ordered_y.is_empty() else 0.0
 	_virtual_height = total
-	if not is_equal_approx(custom_minimum_size.y, total):
-		custom_minimum_size.y = total
+	# Reported height includes BOTTOM_PADDING_PX so the ScrollContainer's
+	# scroll max sits below the last entry, giving in-block chrome
+	# (chevron footers, copy buttons) clear space at the viewport edge.
+	# `_virtual_height` itself stays content-sized — padding is purely
+	# a rendering / scroll-range concern.
+	var reported: float = total + BOTTOM_PADDING_PX if not _entries.is_empty() else 0.0
+	if not is_equal_approx(custom_minimum_size.y, reported):
+		custom_minimum_size.y = reported
 		update_minimum_size()
 	# Same reasoning as _flush_materialize: the scroll bar's max updates one
 	# layout cycle after our min_size change, so a deferred retry after that
@@ -572,8 +586,9 @@ func _update_virtual_height() -> void:
 	_ensure_cumulative_y()
 	var total: float = _ordered_y[_entries.size()] if not _ordered_y.is_empty() else 0.0
 	_virtual_height = total
-	if not is_equal_approx(custom_minimum_size.y, total):
-		custom_minimum_size.y = total
+	var reported: float = total + BOTTOM_PADDING_PX if not _entries.is_empty() else 0.0
+	if not is_equal_approx(custom_minimum_size.y, reported):
+		custom_minimum_size.y = reported
 		update_minimum_size()
 
 
@@ -763,8 +778,9 @@ func _measure_entry(entry_index: int) -> void:
 	ctrl.size.y = min_y
 	_ordered_y_dirty = true
 	_virtual_height += delta
-	if not is_equal_approx(custom_minimum_size.y, _virtual_height):
-		custom_minimum_size.y = _virtual_height
+	var reported: float = _virtual_height + BOTTOM_PADDING_PX if not _entries.is_empty() else 0.0
+	if not is_equal_approx(custom_minimum_size.y, reported):
+		custom_minimum_size.y = reported
 		update_minimum_size()
 
 	# Anchor preservation: when a row whose height was already known

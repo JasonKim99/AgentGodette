@@ -57,6 +57,7 @@ const TOOL_ICON_THINK = preload("res://addons/godette_agent/icons/lucide--brain.
 const TOOL_ICON_WEB = preload("res://addons/godette_agent/icons/lucide--globe.svg")
 const TOOL_ICON_OTHER = preload("res://addons/godette_agent/icons/lucide--hammer.svg")
 const TOOL_ICON_WARNING = preload("res://addons/godette_agent/icons/lucide--alert-triangle.svg")
+const COPY_ICON = preload("res://addons/godette_agent/icons/lucide--copy.svg")
 
 const DEFAULT_AGENT_ID := "claude_agent"
 const HEADER_AGENT_ICON_SIZE := 28
@@ -532,7 +533,15 @@ func _build_ui() -> void:
 	message_scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	message_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	message_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	message_scroll.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_AUTO
+	# Always show the vertical scrollbar so the viewport width stays
+	# constant regardless of content height. With SCROLL_MODE_AUTO,
+	# collapsing a tall code block could shrink content below the
+	# viewport, hiding the scrollbar — that ~17 px width change then
+	# re-wrapped every visible paragraph (and re-measured every list /
+	# table / code block), cascading into virtual_height jitter and
+	# leaving the user's scroll position somewhere unexpected after
+	# fold toggles. SHOW_ALWAYS pins the layout.
+	message_scroll.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_SHOW_ALWAYS
 	add_child(message_scroll)
 
 	var message_padding := MarginContainer.new()
@@ -2204,7 +2213,12 @@ func _make_copy_button(text_to_copy: String, tooltip_label: String = "Copy") -> 
 	button.focus_mode = Control.FOCUS_NONE
 	button.custom_minimum_size = Vector2(22, 22)
 	button.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
-	button.text = "⧉"
+	# Lucide copy glyph instead of the previous unicode `⧉` — keeps the
+	# rest of the icon set visually consistent (header / tool / queue
+	# icons are all Lucide). `expand_icon` lets the SVG fill the
+	# button's content area minus its theme padding.
+	button.icon = COPY_ICON
+	button.expand_icon = true
 	# Translate at the tooltip boundary. Callers pass English labels
 	# (defaults to "Copy" / custom like "Copy Command"); translating
 	# here keeps every call site clean of localization details.
@@ -2223,7 +2237,12 @@ func _on_copy_button_pressed(button: Button) -> void:
 	if text_to_copy.is_empty():
 		return
 	DisplayServer.clipboard_set(text_to_copy)
-	button.text = "✓"
+	# Visual feedback: tint the copy icon green for COPIED_STATE_SECONDS
+	# and swap the tooltip to "Copied!". The icon stays the same Lucide
+	# copy glyph — the colour shift + tooltip is the only "I worked"
+	# signal. (Adding a separate check icon is a follow-up if we want
+	# more explicit feedback; for now the green tint matches the rest
+	# of the dock's success-state pattern.)
 	button.tooltip_text = GodetteI18n.t("Copied!")
 	button.modulate = Color(0.72, 0.94, 0.78, 1.0)
 	var tree := get_tree()
@@ -2236,7 +2255,6 @@ func _on_copy_button_pressed(button: Button) -> void:
 func _reset_copy_button(button: Button) -> void:
 	if not is_instance_valid(button):
 		return
-	button.text = "⧉"
 	button.tooltip_text = str(button.get_meta("copy_tooltip", "Copy"))
 	button.modulate = Color(1.0, 1.0, 1.0, 1.0)
 
