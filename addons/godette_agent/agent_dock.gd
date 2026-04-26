@@ -168,6 +168,11 @@ var replaying_sessions: Dictionary = {}
 var chat_log_refresh_pending := false
 # Hover-on-host groups polled per frame to emulate Zed's bounds-based group_hover.
 var hover_groups: Array = []
+# Shared rotation phase + registered TextureRect targets for the Plan
+# drawer's in-progress task indicators. See `_drive_plan_rotation` for
+# the rationale (one driver instead of N per-row Tweens).
+var _plan_rotation_phase: float = 0.0
+var _plan_rotation_targets: Array = []
 # Coalescing flag for thread menu rebuilds. A session/update burst can call
 # _touch_session hundreds of times in one frame; the menu only needs to
 # reflect the final state, so batch into one rebuild per frame.
@@ -1984,6 +1989,50 @@ func _make_disclosure_chevron(is_open: bool) -> Button:
 	return button
 
 
+# Shared collapsible-header builder used by Plan and Queue drawers.
+# Both drawers used to inline the same HBox + chevron + title pattern;
+# this helper folds them together so future drawer types (or
+# style tweaks like spacing / cursor / overrun behaviour) only need
+# changing in one place.
+#
+# Layout: [chevron] [title (flex)] [trailing controls...]
+# Click anywhere on the row OR on the chevron itself fires `toggle_cb`.
+func _build_drawer_header(
+	parent: Control,
+	title_text: String,
+	is_expanded: bool,
+	toggle_cb: Callable,
+	trailing_controls: Array = [],
+) -> HBoxContainer:
+	var header_row := HBoxContainer.new()
+	header_row.add_theme_constant_override("separation", 6)
+	header_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	header_row.mouse_filter = Control.MOUSE_FILTER_PASS
+	header_row.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
+	header_row.gui_input.connect(
+		Callable(self, "_on_summary_row_gui_input").bind(toggle_cb)
+	)
+	parent.add_child(header_row)
+
+	var chevron := _make_disclosure_chevron(is_expanded)
+	chevron.pressed.connect(toggle_cb)
+	header_row.add_child(chevron)
+
+	var title_label := Label.new()
+	title_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	title_label.modulate = _editor_color("font_color", "Editor", Color(0.95, 0.95, 1.0, 1.0))
+	title_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	title_label.clip_text = true
+	title_label.text = title_text
+	header_row.add_child(title_label)
+
+	for control_variant in trailing_controls:
+		if control_variant is Control:
+			header_row.add_child(control_variant)
+
+	return header_row
+
+
 func _wire_hover_only_visibility(host: Control, targets: Array) -> void:
 	if targets.is_empty():
 		return
@@ -2002,7 +2051,12 @@ func _wire_hover_only_visibility(host: Control, targets: Array) -> void:
 func _process(delta: float) -> void:
 	_update_hover_groups()
 	_drive_streaming_buffers(delta)
-	if hover_groups.is_empty() and streaming_pending.is_empty():
+	_drive_plan_rotation(delta)
+	if (
+		hover_groups.is_empty()
+		and streaming_pending.is_empty()
+		and _plan_rotation_targets.is_empty()
+	):
 		set_process(false)
 
 
@@ -3011,33 +3065,17 @@ func _refresh_plan_drawer() -> void:
 	var is_expanded: bool = plan_expanded_sessions.get(session_key, false)
 	var all_done: bool = _plan_remaining_count(plan_entries) == 0
 
-	# Header: chevron (left) | title (flex) | count | × (right). Chevron
-	# stays anchored left across states so it doesn't jump position when
-	# the title text changes length.
-	var header_row := HBoxContainer.new()
-	header_row.add_theme_constant_override("separation", 6)
-	header_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	header_row.mouse_filter = Control.MOUSE_FILTER_PASS
-	header_row.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
-	header_row.gui_input.connect(Callable(self, "_on_summary_row_gui_input").bind(Callable(self, "_on_plan_summary_pressed").bind(session_key)))
-	plan_drawer_content.add_child(header_row)
-
-	var chevron := _make_disclosure_chevron(is_expanded)
-	chevron.pressed.connect(Callable(self, "_on_plan_summary_pressed").bind(session_key))
-	header_row.add_child(chevron)
-
-	var title_label := Label.new()
-	title_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	title_label.modulate = _editor_color("font_color", "Editor", Color(0.95, 0.95, 1.0, 1.0))
-	title_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
-	title_label.clip_text = true
+	# Title text is state-dependent:
+	#   - expanded   → "Plan"
+	#   - collapsed  → "Current: <task>" (or "Plan" if no current task)
+	var title_text: String
 	if is_expanded:
-		title_label.text = GodetteI18n.t("Plan")
+		title_text = GodetteI18n.t("Plan")
 	else:
 		var current_task: String = _plan_current_task_text(plan_entries)
-		title_label.text = (GodetteI18n.t("Current: %s") % current_task) if not current_task.is_empty() else GodetteI18n.t("Plan")
-	header_row.add_child(title_label)
+		title_text = (GodetteI18n.t("Current: %s") % current_task) if not current_task.is_empty() else GodetteI18n.t("Plan")
 
+	# Trailing controls: count label + × close button.
 	var count_label := Label.new()
 	count_label.modulate = Color(0.91, 0.91, 0.96, 0.66)
 	if all_done:
@@ -3046,11 +3084,17 @@ func _refresh_plan_drawer() -> void:
 		count_label.text = _plan_progress_label(plan_entries)
 	else:
 		count_label.text = GodetteI18n.t_plan_left(_plan_remaining_count(plan_entries))
-	header_row.add_child(count_label)
 
 	var close_button := _make_plan_close_button()
 	close_button.pressed.connect(Callable(self, "_on_plan_close_pressed").bind(session_key))
-	header_row.add_child(close_button)
+
+	_build_drawer_header(
+		plan_drawer_content,
+		title_text,
+		is_expanded,
+		Callable(self, "_on_plan_summary_pressed").bind(session_key),
+		[count_label, close_button],
+	)
 
 	if not is_expanded:
 		return
@@ -3126,26 +3170,6 @@ func _refresh_queue_drawer() -> void:
 	# choice for the session.
 	var is_expanded: bool = queue_expanded_sessions.get(session_key, true)
 
-	var header_row := HBoxContainer.new()
-	header_row.add_theme_constant_override("separation", 6)
-	header_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	header_row.mouse_filter = Control.MOUSE_FILTER_PASS
-	header_row.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
-	header_row.gui_input.connect(Callable(self, "_on_summary_row_gui_input").bind(Callable(self, "_on_queue_summary_pressed").bind(session_key)))
-	queue_drawer_content.add_child(header_row)
-
-	var chevron := _make_disclosure_chevron(is_expanded)
-	chevron.pressed.connect(Callable(self, "_on_queue_summary_pressed").bind(session_key))
-	header_row.add_child(chevron)
-
-	var title_label := Label.new()
-	title_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	title_label.modulate = _editor_color("font_color", "Editor", Color(0.95, 0.95, 1.0, 1.0))
-	title_label.text = GodetteI18n.t_queue_count(queue.size())
-	title_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
-	title_label.clip_text = true
-	header_row.add_child(title_label)
-
 	var clear_all := Button.new()
 	clear_all.flat = true
 	clear_all.focus_mode = Control.FOCUS_NONE
@@ -3154,7 +3178,14 @@ func _refresh_queue_drawer() -> void:
 	clear_all.tooltip_text = GodetteI18n.t("Drop every queued prompt")
 	clear_all.modulate = Color(1.0, 1.0, 1.0, 0.75)
 	clear_all.pressed.connect(Callable(self, "_on_queue_clear_all_pressed"))
-	header_row.add_child(clear_all)
+
+	_build_drawer_header(
+		queue_drawer_content,
+		GodetteI18n.t_queue_count(queue.size()),
+		is_expanded,
+		Callable(self, "_on_queue_summary_pressed").bind(session_key),
+		[clear_all],
+	)
 
 	if not is_expanded:
 		return
@@ -3182,18 +3213,44 @@ func _build_queue_entry_row(entry: Dictionary, index: int) -> Control:
 
 	var row := HBoxContainer.new()
 	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	row.add_theme_constant_override("separation", 4)  # gap_1 equivalent
+	# Match Plan drawer's row separation (8) so the indicator-to-text
+	# gap is identical between the two drawers — used to be 4 here,
+	# which made queue text read as left-aligned closer to the edge
+	# than plan text.
+	row.add_theme_constant_override("separation", 8)
 	row.mouse_filter = Control.MOUSE_FILTER_PASS
 
 	# Circle dot — Color::Accent for head-of-queue, Color::Muted for
 	# the rest. Zed puts "Next in Queue" / "In Queue" in the dot's
 	# tooltip rather than a visible inline label.
+	#
+	# The dot itself is small (10 px), but wrap it in a slot the same
+	# width as the Plan drawer's status icon (14 × editor_scale) so the
+	# preview label starts at the same x offset across both drawers.
+	# Without the slot, queue text was left-aligned ~5 px earlier than
+	# plan text, and the two drawers stacked together looked staggered.
 	var dot := PanelContainer.new()
 	dot.custom_minimum_size = Vector2(10, 10)
+	dot.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
 	dot.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	dot.add_theme_stylebox_override("panel", _queue_dot_style(is_next))
 	dot.tooltip_text = GodetteI18n.t("Next in Queue") if is_next else GodetteI18n.t("In Queue")
-	row.add_child(dot)
+	# MarginContainer slot, sized to the Plan drawer's icon footprint
+	# (14 × editor_scale). Equal left/right margins push the 10 px dot
+	# into the slot's horizontal centre — `CenterContainer` doesn't
+	# work here because `PanelContainer`'s default SIZE_FILL flags
+	# make it consume the whole slot, defeating the centring.
+	var indicator_scale := 1.0
+	if editor_interface != null:
+		indicator_scale = editor_interface.get_editor_scale()
+	var slot_w: float = 14.0 * indicator_scale
+	var side_pad: int = int(max(0.0, (slot_w - 10.0) * 0.5))
+	var indicator_slot := MarginContainer.new()
+	indicator_slot.add_theme_constant_override("margin_left", side_pad)
+	indicator_slot.add_theme_constant_override("margin_right", side_pad)
+	indicator_slot.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	indicator_slot.add_child(dot)
+	row.add_child(indicator_slot)
 
 	var preview_label := Label.new()
 	preview_label.text = _queue_entry_preview(entry)
@@ -3240,37 +3297,35 @@ func _make_queue_icon_button(tooltip: String, icon: Texture2D) -> Button:
 	return button
 
 
-func _make_queue_send_now_button(is_next: bool) -> Button:
-	# Zed renders "Send Now" as a text button (not an icon). The
-	# head-of-queue row gets an Outlined variant so it reads as the
-	# primary affordance; subsequent rows use the default flat look
-	# so they're visible-but-secondary when the user hovers.
+func _make_queue_send_now_button(_is_next: bool) -> Button:
+	# All rows get the same Send Now visual: transparent default, accent
+	# tint on hover. Earlier the head-of-queue had an outlined accent
+	# border to mark it as the primary action — the user found that
+	# inconsistent (border-vs-flat looked like two different button
+	# kinds). Head-of-queue is still distinguished by the colored dot
+	# at the row's left, which is enough.
 	var button := Button.new()
 	button.focus_mode = Control.FOCUS_NONE
 	button.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
 	button.text = GodetteI18n.t("Send Now")
 	button.tooltip_text = GodetteI18n.t("Send this queued message immediately")
-	if is_next:
-		# Outlined — accent border, transparent bg, so it stands out
-		# against the drawer surface.
-		button.add_theme_stylebox_override("normal", _queue_send_now_outlined_style(false))
-		button.add_theme_stylebox_override("hover", _queue_send_now_outlined_style(true))
-		button.add_theme_stylebox_override("pressed", _queue_send_now_outlined_style(true))
-		button.add_theme_stylebox_override("focus", _queue_send_now_outlined_style(false))
-	else:
-		button.flat = true
+	button.add_theme_stylebox_override("normal", _queue_send_now_style(false))
+	button.add_theme_stylebox_override("hover", _queue_send_now_style(true))
+	button.add_theme_stylebox_override("pressed", _queue_send_now_style(true))
+	button.add_theme_stylebox_override("focus", _queue_send_now_style(false))
 	return button
 
 
-func _queue_send_now_outlined_style(emphasized: bool) -> StyleBoxFlat:
+func _queue_send_now_style(hovered: bool) -> StyleBoxFlat:
+	# Flat (no border) base, accent-darkened bg on hover. Same shape +
+	# padding as the old outlined variant so the row's vertical rhythm
+	# doesn't shift when the variant changed.
 	var style := StyleBoxFlat.new()
-	style.bg_color = Color(0, 0, 0, 0) if not emphasized else _editor_color("accent_color", "Editor", Color(0.55, 0.78, 1.0, 1.0)).darkened(0.6)
-	var accent := _editor_color("accent_color", "Editor", Color(0.55, 0.78, 1.0, 1.0))
-	style.border_width_left = 1
-	style.border_width_top = 1
-	style.border_width_right = 1
-	style.border_width_bottom = 1
-	style.border_color = accent
+	if hovered:
+		var accent := _editor_color("accent_color", "Editor", Color(0.55, 0.78, 1.0, 1.0))
+		style.bg_color = accent.darkened(0.6)
+	else:
+		style.bg_color = Color(0, 0, 0, 0)
 	style.corner_radius_top_left = 4
 	style.corner_radius_top_right = 4
 	style.corner_radius_bottom_left = 4
@@ -3716,15 +3771,25 @@ func _editor_font(slot: String, fallback_weight: int, fallback_italic: bool) -> 
 
 
 func _attach_rotation_tween(node: Control) -> void:
-	# Spin the TextureRect to match Zed's TodoProgress behaviour
-	# (2 s per revolution, infinite loop). Deferred so the node is
-	# inside the tree and its size is resolved before we compute
-	# pivot_offset — otherwise the first frames rotate around (0, 0)
-	# and the glyph drifts off its slot.
-	call_deferred("_start_plan_rotation_for", node)
+	# Register the icon with the global rotation driver instead of
+	# spawning a per-row Tween. Deferred so the node is in tree and has
+	# a real size before pivot_offset is computed — otherwise the first
+	# frames would rotate around (0, 0) and the glyph would drift off
+	# its slot.
+	call_deferred("_register_plan_rotation_target", node)
 
 
-func _start_plan_rotation_for(node: Control) -> void:
+# All in-progress plan icons share one rotation phase (TAU per 2 s,
+# matching Zed's TodoProgress). A single _process tick advances the
+# phase and writes it to every registered icon, replacing the old
+# per-row `create_tween().set_loops()` pattern. Two practical wins:
+#   1. Streaming plan updates rebuild the drawer often; the previous
+#      Tween-per-row reset rotation to 0 on every rebuild, so the
+#      glyphs visibly stuttered. The shared phase persists across
+#      drawer rebuilds, so the spin stays continuous.
+#   2. No allocation churn — old code created + freed a Tween for each
+#      row on every refresh.
+func _register_plan_rotation_target(node: Control) -> void:
 	if node == null or not is_instance_valid(node):
 		return
 	if not node.is_inside_tree():
@@ -3733,12 +3798,31 @@ func _start_plan_rotation_for(node: Control) -> void:
 	if pivot == Vector2.ZERO:
 		pivot = node.custom_minimum_size * 0.5
 	node.pivot_offset = pivot
-	node.rotation = 0.0
-	var tween := node.create_tween().set_loops()
-	# `.from(0.0)` resets the start of each loop — without it the
-	# second revolution would tween "from TAU to TAU" (no motion)
-	# because the previous loop left `rotation` at its end value.
-	tween.tween_property(node, "rotation", TAU, 2.0).from(0.0)
+	# Seed the new node at the current phase so it joins the existing
+	# spinners mid-revolution instead of snapping to 0.
+	node.rotation = _plan_rotation_phase
+	if not _plan_rotation_targets.has(node):
+		_plan_rotation_targets.append(node)
+	set_process(true)
+
+
+func _drive_plan_rotation(delta: float) -> void:
+	if _plan_rotation_targets.is_empty():
+		return
+	# 2 s per revolution → angular speed = TAU / 2 rad·s⁻¹.
+	_plan_rotation_phase = fmod(_plan_rotation_phase + delta * TAU * 0.5, TAU)
+	var kept: Array = []
+	for target_variant in _plan_rotation_targets:
+		if target_variant == null or not is_instance_valid(target_variant):
+			continue
+		if not (target_variant is Control):
+			continue
+		var ctrl: Control = target_variant
+		if not ctrl.is_inside_tree():
+			continue
+		ctrl.rotation = _plan_rotation_phase
+		kept.append(target_variant)
+	_plan_rotation_targets = kept
 
 
 func _plan_progress_label(entries: Array) -> String:
