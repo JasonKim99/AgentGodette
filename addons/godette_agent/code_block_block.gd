@@ -230,9 +230,25 @@ signal selection_drag_started(flat_char: int)
 
 
 func _init() -> void:
-	mouse_default_cursor_shape = Control.CURSOR_ARROW
+	mouse_default_cursor_shape = Control.CURSOR_IBEAM
 	mouse_filter = Control.MOUSE_FILTER_STOP
 	clip_contents = true  # horizontal scroll requires clipping overflow
+
+
+# Per-region cursor swap. Tried `_get_cursor_shape` virtual override —
+# never fired in Godot 4.6 for this control type (likely shadowed by
+# the property accessor or signature mismatch). Falling back to the
+# imperative pattern: watch mouse-motion in `_gui_input`, mutate
+# `mouse_default_cursor_shape` to whatever fits the hovered sub-region.
+# 1-frame lag at the edge crossings is imperceptible.
+func _update_cursor_for_position(pos: Vector2) -> void:
+	var new_shape: int = Control.CURSOR_IBEAM
+	if _copy_hit_rect().has_point(pos):
+		new_shape = Control.CURSOR_POINTING_HAND
+	elif _has_horizontal_overflow() and _hit_in_scrollbar(pos):
+		new_shape = Control.CURSOR_ARROW
+	if mouse_default_cursor_shape != new_shape:
+		mouse_default_cursor_shape = new_shape
 
 
 func _notification(what: int) -> void:
@@ -894,6 +910,12 @@ const _WHEEL_STEP_PX: float = 40.0
 
 
 func _gui_input(event: InputEvent) -> void:
+	# Mouse-motion drives per-region cursor swap (copy hand, scrollbar
+	# arrow, default I-beam). Cheap — just a couple of Rect2 hit-tests.
+	if event is InputEventMouseMotion:
+		_update_cursor_for_position((event as InputEventMouseMotion).position)
+		# Don't consume — selection drag-tracking + parent ScrollContainer
+		# both still need the motion event.
 	# Wheel handling: shift+wheel = horizontal scroll within block.
 	# Plain wheel = forward to ancestor ScrollContainer (transcript).
 	if event is InputEventMouseButton:

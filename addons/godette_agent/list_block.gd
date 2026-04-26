@@ -227,7 +227,7 @@ var _content_width: float = 0.0
 
 
 func _init() -> void:
-	mouse_default_cursor_shape = Control.CURSOR_ARROW
+	mouse_default_cursor_shape = Control.CURSOR_IBEAM
 	# STOP filter so wheel events get to us; we forward them to the
 	# enclosing ScrollContainer manually (mirrors text_block.gd's
 	# pattern). With IGNORE the wheel events bubbled to a parent

@@ -272,7 +272,7 @@ signal selection_drag_started(flat_char: int)
 
 
 func _init() -> void:
-	mouse_default_cursor_shape = Control.CURSOR_ARROW
+	mouse_default_cursor_shape = Control.CURSOR_IBEAM
 	mouse_filter = Control.MOUSE_FILTER_STOP
 
 
