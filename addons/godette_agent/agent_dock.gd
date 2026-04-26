@@ -25,6 +25,7 @@ const LoadingScannerScript = preload("res://addons/godette_agent/loading_scanner
 const ComposerContextScript = preload("res://addons/godette_agent/composer_context.gd")
 const ComposerPromptInputScript = preload("res://addons/godette_agent/composer_prompt_input.gd")
 const ComposerChipOverlayScript = preload("res://addons/godette_agent/composer_chip_overlay.gd")
+const EditorTheme = preload("res://addons/godette_agent/editor_theme.gd")
 # Store pasted images under the addon itself so every generated attachment
 # stays in one predictable project-local place. Keep the directory visible
 # (no leading dot) because Claude Code's file layer can skip hidden paths.
@@ -45,25 +46,15 @@ const STOP_ICON = preload("res://addons/godette_agent/icons/stop.svg")
 const QUEUE_ICON = preload("res://addons/godette_agent/icons/lucide--list-end.svg")
 const ADD_ICON = preload("res://addons/godette_agent/icons/add.svg")
 const HISTORY_ICON = preload("res://addons/godette_agent/icons/history.svg")
-# Tool-kind glyphs for the tool card header — Lucide set, matches the ACP
-# kind enum one-to-one (`read` / `search` share one magnifier, `move` /
-# `switch_mode` share one swap icon, per Zed's mapping in thread_view.rs).
-const TOOL_ICON_SEARCH = preload("res://addons/godette_agent/icons/lucide--search.svg")
-const TOOL_ICON_EDIT = preload("res://addons/godette_agent/icons/lucide--pencil.svg")
-const TOOL_ICON_DELETE = preload("res://addons/godette_agent/icons/lucide--trash-2.svg")
-const TOOL_ICON_SWAP = preload("res://addons/godette_agent/icons/lucide--arrow-left-right.svg")
-const TOOL_ICON_TERMINAL = preload("res://addons/godette_agent/icons/lucide--terminal.svg")
-const TOOL_ICON_THINK = preload("res://addons/godette_agent/icons/lucide--brain.svg")
-const TOOL_ICON_WEB = preload("res://addons/godette_agent/icons/lucide--globe.svg")
-const TOOL_ICON_OTHER = preload("res://addons/godette_agent/icons/lucide--hammer.svg")
-const TOOL_ICON_WARNING = preload("res://addons/godette_agent/icons/lucide--alert-triangle.svg")
+# Tool-kind glyphs (TOOL_ICON_*) live on GodetteEditorTheme alongside the
+# `tool_kind_icon()` mapping that consumes them.
 const COPY_ICON = preload("res://addons/godette_agent/icons/lucide--copy.svg")
 
 const DEFAULT_AGENT_ID := "claude_agent"
 const HEADER_AGENT_ICON_SIZE := 28
 const THREAD_MENU_AGENT_ICON_SIZE := HEADER_AGENT_ICON_SIZE
 # Fallbacks used only when the editor hasn't handed us a theme / settings.
-# Actual runtime values are pulled via _editor_main_font_size() etc. so the
+# Actual runtime values are pulled via EditorTheme.main_font_size() etc. so the
 # dock tracks the user's Godot editor preferences.
 const STREAM_BODY_FONT_SIZE_FALLBACK := 14
 const STREAM_BODY_LINE_SPACING := 4.0
@@ -237,130 +228,8 @@ func _wire_scene_selection_listener() -> void:
 		selection.selection_changed.connect(_on_scene_selection_changed)
 
 
-# --- Editor theme helpers --------------------------------------------------
-# Pull font + color from the Godot editor's live theme/settings so the dock
-# inherits the user's preferences (dark/light theme, font size override,
-# custom accent). Silent fallbacks keep things working when run outside the
-# editor context.
-
-func _editor_main_font_size() -> int:
-	if editor_interface != null:
-		var settings := editor_interface.get_editor_settings()
-		if settings != null and settings.has_setting("interface/editor/main_font_size"):
-			var size := int(settings.get_setting("interface/editor/main_font_size"))
-			if size > 0:
-				return size
-		var theme := editor_interface.get_editor_theme()
-		if theme != null and theme.default_font_size > 0:
-			return int(theme.default_font_size)
-	return STREAM_BODY_FONT_SIZE_FALLBACK
-
-
-func _editor_default_font() -> Font:
-	if editor_interface == null:
-		return null
-	var theme := editor_interface.get_editor_theme()
-	if theme == null:
-		return null
-	return theme.default_font
-
-
-func _editor_color(name: String, type_name: String, fallback: Color) -> Color:
-	if editor_interface == null:
-		return fallback
-	var theme := editor_interface.get_editor_theme()
-	if theme == null:
-		return fallback
-	if theme.has_color(name, type_name):
-		return theme.get_color(name, type_name)
-	return fallback
-
-
-func _tool_kind_icon(tool_kind: String, title_hint: String = "") -> Texture2D:
-	# Map ACP's `toolKind` to a Lucide glyph — mirrors Zed's switch in
-	# thread_view.rs:7368-7380. For adapters that don't populate
-	# `toolKind` (or use "other"), we fall back to a keyword scan on
-	# the tool's visible title so terminal / read / edit commands still
-	# get a meaningful icon.
-	match tool_kind:
-		"read":
-			return TOOL_ICON_SEARCH
-		"edit":
-			return TOOL_ICON_EDIT
-		"delete":
-			return TOOL_ICON_DELETE
-		"move":
-			return TOOL_ICON_SWAP
-		"search":
-			return TOOL_ICON_SEARCH
-		"execute":
-			return TOOL_ICON_TERMINAL
-		"think":
-			return TOOL_ICON_THINK
-		"fetch":
-			return TOOL_ICON_WEB
-		"switch_mode":
-			return TOOL_ICON_SWAP
-
-	# Heuristic for "other" / missing kind — Claude Agent ACP in practice
-	# marks almost every tool as "other", so the kind field alone isn't
-	# enough to pick a meaningful glyph.
-	var lowered: String = title_hint.to_lower()
-	if "run " in lowered or "exec" in lowered or "$" in lowered or "bash" in lowered or "powershell" in lowered:
-		return TOOL_ICON_TERMINAL
-	if "read" in lowered or "cat " in lowered or "open " in lowered:
-		return TOOL_ICON_SEARCH
-	if "write" in lowered or "edit" in lowered or "patch" in lowered or "apply" in lowered:
-		return TOOL_ICON_EDIT
-	if "delete" in lowered or "rm " in lowered or "remove" in lowered:
-		return TOOL_ICON_DELETE
-	if "move" in lowered or "mv " in lowered or "rename" in lowered:
-		return TOOL_ICON_SWAP
-	if "fetch" in lowered or "http" in lowered or "url" in lowered or "web" in lowered:
-		return TOOL_ICON_WEB
-	if "search" in lowered or "grep" in lowered or "find" in lowered:
-		return TOOL_ICON_SEARCH
-	if "think" in lowered or "plan" in lowered or "todo" in lowered:
-		return TOOL_ICON_THINK
-	return TOOL_ICON_OTHER
-
-
-func _tool_status_color(raw_status: String, awaiting_permission: bool) -> Color:
-	# Match Zed's status semantics on the tool-kind icon tint. Completed /
-	# unknown renders at the normal muted text color; exceptional states
-	# borrow the warning / error chroma so the icon carries the signal
-	# even without an adjacent status word.
-	if awaiting_permission:
-		return Color(0.98, 0.86, 0.52, 0.95)  # warning amber
-	match raw_status:
-		"failed", "error":
-			return Color(0.95, 0.48, 0.50, 0.95)  # error red
-		"canceled", "cancelled", "rejected":
-			return Color(0.78, 0.80, 0.85, 0.72)  # muted
-		"pending", "in_progress", "running":
-			return Color(0.58, 0.78, 1.0, 0.95)   # accent / in-flight blue
-		_:
-			# "completed" and anything else default to the editor's
-			# readonly/muted text color so the icon reads as "done,
-			# nothing to flag".
-			return _editor_color("font_readonly_color", "Editor", Color(0.78, 0.80, 0.85, 0.90))
-
-
-func _apply_icon_button_theme(button: Button, icon_px: int) -> void:
-	# Mirror Zed's icon-button sizing (14 px for Small, 16 px for Medium —
-	# IconSize::Small / Medium in gpui/ui) and tint the `currentColor`
-	# SVGs with the editor's font color so they read correctly in both
-	# light and dark themes. Without this the raw SVG renders at its
-	# intrinsic 64 px and at `rgb(74, 85, 101)` — too big and too muted
-	# against a dark panel.
-	button.add_theme_constant_override("icon_max_width", icon_px)
-	var icon_color := _editor_color("font_color", "Editor", Color(0.88, 0.88, 0.92, 0.95))
-	var muted := Color(icon_color.r, icon_color.g, icon_color.b, 0.55)
-	button.add_theme_color_override("icon_normal_color", icon_color)
-	button.add_theme_color_override("icon_hover_color", icon_color)
-	button.add_theme_color_override("icon_focus_color", icon_color)
-	button.add_theme_color_override("icon_pressed_color", icon_color)
-	button.add_theme_color_override("icon_disabled_color", muted)
+# Editor-theme helpers (font / color / tool-kind icon / icon button styling)
+# moved to EditorTheme.
 
 
 func _safe_text(text: String) -> String:
@@ -507,14 +376,14 @@ func _build_ui() -> void:
 	thread_switcher_button.focus_mode = Control.FOCUS_NONE
 	thread_switcher_button.tooltip_text = GodetteI18n.t("Switch thread")
 	thread_switcher_button.icon = HISTORY_ICON
-	_apply_icon_button_theme(thread_switcher_button, HEADER_AGENT_ICON_SIZE)
+	EditorTheme.apply_icon_button_theme(thread_switcher_button, HEADER_AGENT_ICON_SIZE)
 	thread_switcher_button.pressed.connect(Callable(self, "_on_thread_switcher_pressed"))
 	header_row.add_child(thread_switcher_button)
 
 	add_menu = MenuButton.new()
 	add_menu.flat = true
 	add_menu.icon = ADD_ICON
-	_apply_icon_button_theme(add_menu, HEADER_AGENT_ICON_SIZE)
+	EditorTheme.apply_icon_button_theme(add_menu, HEADER_AGENT_ICON_SIZE)
 	add_menu.get_popup().id_pressed.connect(Callable(self, "_on_add_menu_id_pressed"))
 	header_row.add_child(add_menu)
 
@@ -531,7 +400,7 @@ func _build_ui() -> void:
 		loading_scanner = LoadingScannerScript.new()
 		loading_scanner.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		loading_scanner.visible = false
-		loading_scanner.set_accent(_editor_color("accent_color", "Editor", Color(0.55, 0.78, 1.0, 1.0)))
+		loading_scanner.set_accent(EditorTheme.color("accent_color", "Editor", Color(0.55, 0.78, 1.0, 1.0)))
 		add_child(loading_scanner)
 
 	message_scroll = ScrollContainer.new()
@@ -641,10 +510,10 @@ func _build_ui() -> void:
 	prompt_input.custom_minimum_size = Vector2(0, 120)
 	prompt_input.placeholder_text = _prompt_placeholder(DEFAULT_AGENT_ID)
 	prompt_input.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	var prompt_font_color := _editor_color("font_color", "Editor", Color(0.97, 0.97, 0.995, 0.98))
-	var prompt_placeholder_color := _editor_color("font_placeholder_color", "Editor", prompt_font_color.darkened(0.35))
-	var prompt_caret := _editor_color("accent_color", "Editor", Color(0.58, 0.78, 1.0, 0.98))
-	var prompt_selection := _editor_color("selection_color", "Editor", prompt_caret)
+	var prompt_font_color := EditorTheme.color("font_color", "Editor", Color(0.97, 0.97, 0.995, 0.98))
+	var prompt_placeholder_color := EditorTheme.color("font_placeholder_color", "Editor", prompt_font_color.darkened(0.35))
+	var prompt_caret := EditorTheme.color("accent_color", "Editor", Color(0.58, 0.78, 1.0, 0.98))
+	var prompt_selection := EditorTheme.color("selection_color", "Editor", prompt_caret)
 	prompt_selection.a = 0.4
 	prompt_input.add_theme_color_override("font_color", prompt_font_color)
 	prompt_input.add_theme_color_override("font_selected_color", prompt_font_color)
@@ -799,7 +668,7 @@ func _build_ui() -> void:
 	send_button.icon = SEND_ICON
 	send_button.tooltip_text = GodetteI18n.t("Send")
 	send_button.custom_minimum_size = Vector2(52, 40)
-	_apply_icon_button_theme(send_button, HEADER_AGENT_ICON_SIZE)
+	EditorTheme.apply_icon_button_theme(send_button, HEADER_AGENT_ICON_SIZE)
 	send_button.pressed.connect(Callable(self, "_on_send_button_pressed"))
 	composer_options_bar.add_child(send_button)
 
@@ -1520,7 +1389,7 @@ func _tool_call_style(entry: Dictionary, awaiting_permission: bool) -> String:
 	if tool_kind == "edit" or tool_kind == "execute":
 		return "card"
 	# Claude Agent ACP marks most tools as "other"; fall back to the same
-	# heuristic _tool_kind_icon uses so obvious terminal/edit commands also
+	# heuristic EditorTheme.tool_kind_icon uses so obvious terminal/edit commands also
 	# get the card treatment. Keep this scan in sync with that function.
 	if tool_kind == "other" or tool_kind == "":
 		var title_hint: String = _stream_entry_title(entry, "tool").to_lower()
@@ -1575,10 +1444,10 @@ func _build_tool_call_inline(entry: Dictionary) -> Control:
 	var tool_kind: String = str(entry.get("tool_kind", "")).to_lower()
 	var title_text: String = _stream_entry_title(entry, "tool")
 	var raw_status: String = str(entry.get("status", "pending")).to_lower()
-	var muted_color := _editor_color("font_readonly_color", "Editor", Color(0.78, 0.80, 0.85, 0.90))
+	var muted_color := EditorTheme.color("font_readonly_color", "Editor", Color(0.78, 0.80, 0.85, 0.90))
 
 	var tool_icon_rect := TextureRect.new()
-	tool_icon_rect.texture = _tool_kind_icon(tool_kind, title_text)
+	tool_icon_rect.texture = EditorTheme.tool_kind_icon(tool_kind, title_text)
 	# Zed pins IconSize::Small = 14 px (constant) against a 13 px label.
 	# Our label inherits the editor theme font (often 16-20+ at HiDPI),
 	# so a fixed 14 looks too small there. Scale icon to ~80 % of the
@@ -1683,7 +1552,7 @@ func _make_tool_code_card(text: String) -> Control:
 	var panel := PanelContainer.new()
 	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	var style := StyleBoxFlat.new()
-	var bg := _editor_color("dark_color_3", "Editor", Color(0, 0, 0, 0.30))
+	var bg := EditorTheme.color("dark_color_3", "Editor", Color(0, 0, 0, 0.30))
 	bg.a = max(bg.a, 0.35)
 	style.bg_color = bg
 	style.set_corner_radius_all(4)
@@ -1698,11 +1567,11 @@ func _make_tool_code_card(text: String) -> Control:
 
 	var tb: GodetteTextBlock = TextBlockScript.new()
 	tb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	tb.set_font(_editor_font("source", 400, false))
+	tb.set_font(EditorTheme.font("source", 400, false))
 	tb.set_line_spacing(STREAM_BODY_LINE_SPACING)
-	var fg := _editor_color("font_color", "Editor", Color(0.93, 0.94, 0.98, 0.96))
+	var fg := EditorTheme.color("font_color", "Editor", Color(0.93, 0.94, 0.98, 0.96))
 	tb.set_color(fg)
-	var sel := _editor_color("selection_color", "Editor", Color(0.36, 0.52, 0.85, 1.0))
+	var sel := EditorTheme.color("selection_color", "Editor", Color(0.36, 0.52, 0.85, 1.0))
 	sel.a = 0.55
 	tb.set_selection_color(sel)
 	tb.set_text(text)
@@ -1791,7 +1660,7 @@ func _build_tool_call_card(entry: Dictionary, awaiting_permission: bool) -> Cont
 	var tool_kind: String = str(entry.get("tool_kind", "")).to_lower()
 	var title_text: String = _stream_entry_title(entry, "tool")
 	var tool_icon_rect := TextureRect.new()
-	tool_icon_rect.texture = _tool_kind_icon(tool_kind, title_text)
+	tool_icon_rect.texture = EditorTheme.tool_kind_icon(tool_kind, title_text)
 	# See _build_tool_call_inline for the scaling rationale. Same 0.8x
 	# ratio here keeps the card header icon at the same visual weight as
 	# the inline path's icons.
@@ -1799,7 +1668,7 @@ func _build_tool_call_card(entry: Dictionary, awaiting_permission: bool) -> Cont
 	tool_icon_rect.custom_minimum_size = Vector2(card_icon_px, card_icon_px)
 	tool_icon_rect.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 	tool_icon_rect.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
-	tool_icon_rect.modulate = _tool_status_color(raw_status, awaiting_permission)
+	tool_icon_rect.modulate = EditorTheme.tool_status_color(raw_status, awaiting_permission)
 	tool_icon_rect.mouse_filter = Control.MOUSE_FILTER_PASS
 	header_row.add_child(tool_icon_rect)
 
@@ -1895,7 +1764,7 @@ func _make_show_more_toggle(is_expanded: bool, expand_key: String) -> Control:
 	button.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
 	button.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
 	button.text = GodetteI18n.t("Show less ⌃") if is_expanded else GodetteI18n.t("Show full command ⌄")
-	button.modulate = _editor_color("font_readonly_color", "Editor", Color(0.7, 0.7, 0.8, 0.85))
+	button.modulate = EditorTheme.color("font_readonly_color", "Editor", Color(0.7, 0.7, 0.8, 0.85))
 	button.pressed.connect(Callable(self, "_on_tool_call_show_more_pressed").bind(expand_key))
 	return button
 
@@ -1978,8 +1847,8 @@ func _make_disclosure_chevron(is_open: bool) -> Button:
 	# to drift vertically because their metrics don't share the Label
 	# font's x-height. Fall back to the text glyph only when no editor
 	# theme is available.
-	var open_icon := _editor_theme_icon("GuiTreeArrowDown")
-	var closed_icon := _editor_theme_icon("GuiTreeArrowRight")
+	var open_icon := EditorTheme.theme_icon("GuiTreeArrowDown")
+	var closed_icon := EditorTheme.theme_icon("GuiTreeArrowRight")
 	var icon: Texture2D = open_icon if is_open else closed_icon
 	if icon != null:
 		button.icon = icon
@@ -2020,7 +1889,7 @@ func _build_drawer_header(
 
 	var title_label := Label.new()
 	title_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	title_label.modulate = _editor_color("font_color", "Editor", Color(0.95, 0.95, 1.0, 1.0))
+	title_label.modulate = EditorTheme.color("font_color", "Editor", Color(0.95, 0.95, 1.0, 1.0))
 	title_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
 	title_label.clip_text = true
 	title_label.text = title_text
@@ -2207,7 +2076,7 @@ func _build_permission_option_row(request_id: int) -> Control:
 	wrapper.add_theme_constant_override("margin_bottom", 4)
 
 	var separator := HSeparator.new()
-	separator.modulate = _editor_color("contrast_color_1", "Editor", Color(0.4, 0.4, 0.45, 0.6))
+	separator.modulate = EditorTheme.color("contrast_color_1", "Editor", Color(0.4, 0.4, 0.45, 0.6))
 
 	var col := VBoxContainer.new()
 	col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -2217,8 +2086,8 @@ func _build_permission_option_row(request_id: int) -> Control:
 
 	var pending: Dictionary = pending_permissions.get(request_id, {})
 	var options: Array = pending.get("options", [])
-	var success_color: Color = _editor_color("success_color", "Editor", Color(0.48, 0.80, 0.54))
-	var error_color: Color = _editor_color("error_color", "Editor", Color(0.93, 0.50, 0.50))
+	var success_color: Color = EditorTheme.color("success_color", "Editor", Color(0.48, 0.80, 0.54))
+	var error_color: Color = EditorTheme.color("error_color", "Editor", Color(0.93, 0.50, 0.50))
 
 	for index in range(options.size()):
 		var option_variant = options[index]
@@ -2526,7 +2395,7 @@ func _build_user_bubble_flow(segments: Array) -> Control:
 	# not hyperlinks — kill the underline so the run reads as a tag.
 	rtl.meta_underlined = false
 
-	var body_color := _editor_color("font_color", "Editor", Color(0.93, 0.94, 0.98, 0.96))
+	var body_color := EditorTheme.color("font_color", "Editor", Color(0.93, 0.94, 0.98, 0.96))
 	rtl.add_theme_color_override("default_color", body_color)
 
 	# Meta click handler needs the segment list so it can resolve the
@@ -2589,7 +2458,7 @@ func _user_bubble_chip_bg_color() -> Color:
 	# Subtly lighter than the bubble base so the chip run pops without
 	# competing with the editor accent. Alpha < 1 softens the edge where
 	# the bgcolor meets the surrounding text background.
-	var base := _editor_color("base_color", "Editor", Color(0.16, 0.17, 0.19, 1.0))
+	var base := EditorTheme.color("base_color", "Editor", Color(0.16, 0.17, 0.19, 1.0))
 	var chip_color := base.lightened(0.18)
 	chip_color.a = 0.85
 	return chip_color
@@ -2850,14 +2719,14 @@ func _make_stream_text(text: String, kind: String = "") -> Control:
 	# the editor's Label typography (including HiDPI scaling the editor
 	# applies on top of the user's configured main font size).
 
-	var body_color := _editor_color("font_color", "Editor", Color(0.93, 0.94, 0.98, 0.96))
-	var muted_color := _editor_color("font_readonly_color", "Editor", body_color.darkened(0.2))
+	var body_color := EditorTheme.color("font_color", "Editor", Color(0.93, 0.94, 0.98, 0.96))
+	var muted_color := EditorTheme.color("font_readonly_color", "Editor", body_color.darkened(0.2))
 	# Match the CodeEdit selection chroma: editor `selection_color` is
 	# what the user already recognises as "selected text" across every
 	# other editor surface. Its native alpha is around 1.0; bumping it
 	# slightly toward translucent (alpha 0.55) keeps the underlying
 	# glyphs legible while the selection is visible.
-	var selection_color := _editor_color(
+	var selection_color := EditorTheme.color(
 		"selection_color",
 		"Editor",
 		Color(0.36, 0.52, 0.85, 1.0)
@@ -2917,9 +2786,9 @@ func _make_markdown_blocks(text: String, kind: String) -> Control:
 # block widget can pull from a consistent palette without re-reading the
 # editor theme N times. The fonts live for the lifetime of the entry.
 func _markdown_render_context(kind: String) -> Dictionary:
-	var body_color := _editor_color("font_color", "Editor", Color(0.93, 0.94, 0.98, 0.96))
-	var muted_color := _editor_color("font_readonly_color", "Editor", body_color.darkened(0.2))
-	var selection_color := _editor_color("selection_color", "Editor", Color(0.36, 0.52, 0.85, 1.0))
+	var body_color := EditorTheme.color("font_color", "Editor", Color(0.93, 0.94, 0.98, 0.96))
+	var muted_color := EditorTheme.color("font_readonly_color", "Editor", body_color.darkened(0.2))
+	var selection_color := EditorTheme.color("selection_color", "Editor", Color(0.36, 0.52, 0.85, 1.0))
 	selection_color.a = 0.55
 
 	var fg: Color = body_color
@@ -2935,26 +2804,26 @@ func _markdown_render_context(kind: String) -> Dictionary:
 	# loses italic), mono_bold → mono. SystemFont fallbacks only kick
 	# in when running without an editor interface (unlikely in practice
 	# for an editor plugin but defensive).
-	var bold: Font = _editor_font("bold", 700, false)
-	var italic: Font = _editor_font("italic", 400, true)
-	var bold_italic: Font = _editor_font("bold", 700, false)
-	var mono: Font = _editor_font("source", 400, false)
-	var mono_bold: Font = _editor_font("source", 700, false)
+	var bold: Font = EditorTheme.font("bold", 700, false)
+	var italic: Font = EditorTheme.font("italic", 400, true)
+	var bold_italic: Font = EditorTheme.font("bold", 700, false)
+	var mono: Font = EditorTheme.font("source", 400, false)
+	var mono_bold: Font = EditorTheme.font("source", 700, false)
 
 	# Code chip background uses the editor's "dark_color_2" / fallback to a
 	# slightly lighter surface than the panel itself so chips read as raised.
-	var code_bg := _editor_color("dark_color_2", "Editor", Color(1, 1, 1, 0.06))
+	var code_bg := EditorTheme.color("dark_color_2", "Editor", Color(1, 1, 1, 0.06))
 	code_bg.a = max(code_bg.a, 0.18)
-	var code_block_bg := _editor_color("dark_color_3", "Editor", Color(0, 0, 0, 0.25))
+	var code_block_bg := EditorTheme.color("dark_color_3", "Editor", Color(0, 0, 0, 0.25))
 	code_block_bg.a = max(code_block_bg.a, 0.22)
 	var rule_color := body_color
 	rule_color.a = 0.18
-	var blockquote_bar := _editor_color("accent_color", "Editor", Color(0.55, 0.78, 1.0, 1.0))
+	var blockquote_bar := EditorTheme.color("accent_color", "Editor", Color(0.55, 0.78, 1.0, 1.0))
 	blockquote_bar.a = 0.5
 	# Link "chip" background — subtle so links read as inline but flagged.
 	# Real per-glyph colour for links would need a glyph self-draw path,
 	# which is intentionally out of scope for v1 (see TextBlock.set_color).
-	var link_bg := _editor_color("accent_color", "Editor", Color(0.55, 0.78, 1.0, 1.0))
+	var link_bg := EditorTheme.color("accent_color", "Editor", Color(0.55, 0.78, 1.0, 1.0))
 	link_bg.a = 0.18
 
 	return {
@@ -2992,9 +2861,9 @@ func _user_prompt_style() -> StyleBoxFlat:
 	var style := StyleBoxFlat.new()
 	# Editor "base_color" is the main panel background; darken slightly to
 	# give the user bubble its own presence against surrounding feed chrome.
-	var base := _editor_color("base_color", "Editor", Color(0.16, 0.17, 0.19, 1.0))
+	var base := EditorTheme.color("base_color", "Editor", Color(0.16, 0.17, 0.19, 1.0))
 	style.bg_color = base.darkened(0.25)
-	var accent := _editor_color("accent_color", "Editor", Color(0.48, 0.52, 0.60, 1.0))
+	var accent := EditorTheme.color("accent_color", "Editor", Color(0.48, 0.52, 0.60, 1.0))
 	style.border_width_left = 1
 	style.border_width_top = 1
 	style.border_width_right = 1
@@ -3013,10 +2882,10 @@ func _user_prompt_style() -> StyleBoxFlat:
 
 func _prompt_input_style(focused: bool) -> StyleBoxFlat:
 	var style := StyleBoxFlat.new()
-	var base := _editor_color("base_color", "Editor", Color(0.06, 0.07, 0.09, 1.0))
+	var base := EditorTheme.color("base_color", "Editor", Color(0.06, 0.07, 0.09, 1.0))
 	style.bg_color = base.darkened(0.15)
-	var accent := _editor_color("accent_color", "Editor", Color(0.48, 0.52, 0.60, 1.0))
-	var contrast := _editor_color("contrast_color_1", "Editor", Color(0.30, 0.33, 0.40, 1.0))
+	var accent := EditorTheme.color("accent_color", "Editor", Color(0.48, 0.52, 0.60, 1.0))
+	var contrast := EditorTheme.color("contrast_color_1", "Editor", Color(0.30, 0.33, 0.40, 1.0))
 	style.border_width_left = 1
 	style.border_width_top = 1
 	style.border_width_right = 1
@@ -3123,8 +2992,8 @@ func _plan_drawer_style() -> StyleBoxFlat:
 	# composer's top edge seamlessly (Zed's rounded_t_md + border_b_0
 	# pattern).
 	var style := StyleBoxFlat.new()
-	var base := _editor_color("base_color", "Editor", Color(0.16, 0.17, 0.19, 1.0))
-	style.bg_color = _editor_color("dark_color_1", "Editor", base.darkened(0.04))
+	var base := EditorTheme.color("base_color", "Editor", Color(0.16, 0.17, 0.19, 1.0))
+	style.bg_color = EditorTheme.color("dark_color_1", "Editor", base.darkened(0.04))
 	style.corner_radius_top_left = 6
 	style.corner_radius_top_right = 6
 	style.corner_radius_bottom_left = 0
@@ -3133,7 +3002,7 @@ func _plan_drawer_style() -> StyleBoxFlat:
 	style.border_width_top = 1
 	style.border_width_right = 1
 	style.border_width_bottom = 0
-	style.border_color = _editor_color("contrast_color_1", "Editor", base.lightened(0.12))
+	style.border_color = EditorTheme.color("contrast_color_1", "Editor", base.lightened(0.12))
 	return style
 
 
@@ -3257,18 +3126,18 @@ func _build_queue_entry_row(entry: Dictionary, index: int) -> Control:
 	preview_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	preview_label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
 	preview_label.clip_text = true
-	preview_label.modulate = _editor_color("font_color", "Editor", Color(0.95, 0.95, 1.0, 1.0)) if is_next else Color(1.0, 1.0, 1.0, 0.72)
+	preview_label.modulate = EditorTheme.color("font_color", "Editor", Color(0.95, 0.95, 1.0, 1.0)) if is_next else Color(1.0, 1.0, 1.0, 0.72)
 	row.add_child(preview_label)
 
 	# Action triplet on the right — Zed order (thread_view.rs:3480-3555):
 	# Trash (IconButton) → Pencil (IconButton) → Send Now (text button).
 	# The first entry shows everything by default; other entries hide
 	# the group until the row is hovered.
-	var delete_button := _make_queue_icon_button("Remove Message from Queue", _editor_theme_icon("Remove"))
+	var delete_button := _make_queue_icon_button("Remove Message from Queue", EditorTheme.theme_icon("Remove"))
 	delete_button.pressed.connect(Callable(self, "_on_queue_delete_pressed").bind(index))
 	row.add_child(delete_button)
 
-	var edit_button := _make_queue_icon_button("Edit", _editor_theme_icon("Edit"))
+	var edit_button := _make_queue_icon_button("Edit", EditorTheme.theme_icon("Edit"))
 	edit_button.pressed.connect(Callable(self, "_on_queue_edit_pressed").bind(index))
 	row.add_child(edit_button)
 
@@ -3322,7 +3191,7 @@ func _queue_send_now_style(hovered: bool) -> StyleBoxFlat:
 	# doesn't shift when the variant changed.
 	var style := StyleBoxFlat.new()
 	if hovered:
-		var accent := _editor_color("accent_color", "Editor", Color(0.55, 0.78, 1.0, 1.0))
+		var accent := EditorTheme.color("accent_color", "Editor", Color(0.55, 0.78, 1.0, 1.0))
 		style.bg_color = accent.darkened(0.6)
 	else:
 		style.bg_color = Color(0, 0, 0, 0)
@@ -3374,8 +3243,8 @@ func _queue_drawer_style() -> StyleBoxFlat:
 	# drawers are visible they stack cleanly into one continuous
 	# "composer tray" without a gap or a colour shift.
 	var style := StyleBoxFlat.new()
-	var base := _editor_color("base_color", "Editor", Color(0.16, 0.17, 0.19, 1.0))
-	style.bg_color = _editor_color("dark_color_1", "Editor", base.darkened(0.04))
+	var base := EditorTheme.color("base_color", "Editor", Color(0.16, 0.17, 0.19, 1.0))
+	style.bg_color = EditorTheme.color("dark_color_1", "Editor", base.darkened(0.04))
 	style.corner_radius_top_left = 6
 	style.corner_radius_top_right = 6
 	style.corner_radius_bottom_left = 0
@@ -3384,7 +3253,7 @@ func _queue_drawer_style() -> StyleBoxFlat:
 	style.border_width_top = 1
 	style.border_width_right = 1
 	style.border_width_bottom = 0
-	style.border_color = _editor_color("contrast_color_1", "Editor", base.lightened(0.12))
+	style.border_color = EditorTheme.color("contrast_color_1", "Editor", base.lightened(0.12))
 	return style
 
 
@@ -3392,9 +3261,9 @@ func _queue_dot_style(is_next: bool) -> StyleBoxFlat:
 	var style := StyleBoxFlat.new()
 	var fill: Color
 	if is_next:
-		fill = _editor_color("accent_color", "Editor", Color(0.55, 0.78, 1.0, 1.0))
+		fill = EditorTheme.color("accent_color", "Editor", Color(0.55, 0.78, 1.0, 1.0))
 	else:
-		fill = _editor_color("font_readonly_color", "Editor", Color(0.78, 0.79, 0.84, 0.55))
+		fill = EditorTheme.color("font_readonly_color", "Editor", Color(0.78, 0.79, 0.84, 0.55))
 	style.bg_color = fill
 	style.corner_radius_top_left = 99
 	style.corner_radius_top_right = 99
@@ -3706,13 +3575,13 @@ func _build_plan_status_indicator(status: String) -> Control:
 	match status:
 		"completed":
 			icon = TODO_COMPLETE_ICON
-			color = _editor_color("success_color", "Editor", Color(0.34, 0.82, 0.47, 1.0))
+			color = EditorTheme.color("success_color", "Editor", Color(0.34, 0.82, 0.47, 1.0))
 		"in_progress":
 			icon = TODO_PROGRESS_ICON
-			color = _editor_color("accent_color", "Editor", Color(0.55, 0.78, 1.0, 1.0))
+			color = EditorTheme.color("accent_color", "Editor", Color(0.55, 0.78, 1.0, 1.0))
 		_:
 			icon = TODO_PENDING_ICON
-			color = _editor_color("font_readonly_color", "Editor", Color(0.85, 0.85, 0.90, 0.55))
+			color = EditorTheme.color("font_readonly_color", "Editor", Color(0.85, 0.85, 0.90, 0.55))
 
 	# 14 px at 1.0 UI scale (same as Zed's `IconSize::Small`). Multiply
 	# by EditorInterface's display scale so the glyph keeps pace with
@@ -3731,43 +3600,6 @@ func _build_plan_status_indicator(status: String) -> Control:
 	rect.modulate = color
 	rect.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	return rect
-
-
-func _editor_theme_icon(icon_name: String) -> Texture2D:
-	if editor_interface == null:
-		return null
-	var theme: Theme = editor_interface.get_editor_theme()
-	if theme == null:
-		return null
-	if theme.has_icon(icon_name, "EditorIcons"):
-		return theme.get_icon(icon_name, "EditorIcons")
-	return null
-
-
-# Return the editor theme's font at the given slot (EditorFonts type).
-# Slots used: "main", "bold", "italic", "source". Falls back to
-# SystemFont with `weight` + `italic` trait hints when the editor theme
-# is unavailable — keeps the plugin from crashing in standalone runs.
-# The SystemFont fallback mirrors the editor's defaults (Inter for
-# main/bold/italic, JetBrains Mono for source) via its font_names list.
-func _editor_font(slot: String, fallback_weight: int, fallback_italic: bool) -> Font:
-	if editor_interface != null:
-		var theme: Theme = editor_interface.get_editor_theme()
-		if theme != null and theme.has_font(slot, "EditorFonts"):
-			return theme.get_font(slot, "EditorFonts")
-	var sys := SystemFont.new()
-	if slot == "source":
-		sys.font_names = PackedStringArray([
-			"JetBrains Mono", "Cascadia Mono", "Cascadia Code", "Consolas",
-			"Fira Code", "SF Mono", "Menlo", "Monaco", "Courier New", "monospace",
-		])
-	else:
-		sys.font_names = PackedStringArray([
-			"Inter", "Segoe UI", "SF Pro Text", "Noto Sans", "Arial", "sans-serif",
-		])
-	sys.font_weight = fallback_weight
-	sys.font_italic = fallback_italic
-	return sys
 
 
 func _attach_rotation_tween(node: Control) -> void:
@@ -3874,7 +3706,7 @@ func _stream_panel_style(kind: String) -> StyleBoxFlat:
 	# All card backgrounds derive from the editor's "base_color". Per-kind
 	# tweaks are small offsets so the feed reads as "subtly banded" rather
 	# than a rainbow of panel colors.
-	var base := _editor_color("base_color", "Editor", Color(0.16, 0.17, 0.19, 1.0))
+	var base := EditorTheme.color("base_color", "Editor", Color(0.16, 0.17, 0.19, 1.0))
 	var background: Color = base
 	match kind:
 		"user":
@@ -3894,7 +3726,7 @@ func _stream_panel_style(kind: String) -> StyleBoxFlat:
 	style.border_width_bottom = 1
 	# Editor "contrast_color_1" is the default border color in dark themes;
 	# falls back to a lightened base if the theme doesn't define it.
-	style.border_color = _editor_color("contrast_color_1", "Editor", background.lightened(0.08))
+	style.border_color = EditorTheme.color("contrast_color_1", "Editor", background.lightened(0.08))
 	style.corner_radius_top_left = 6
 	style.corner_radius_top_right = 6
 	style.corner_radius_bottom_right = 6
@@ -3903,8 +3735,8 @@ func _stream_panel_style(kind: String) -> StyleBoxFlat:
 
 
 func _stream_title_color(kind: String) -> Color:
-	var base := _editor_color("font_color", "Editor", Color(0.95, 0.95, 1.0, 1.0))
-	var muted := _editor_color("font_readonly_color", "Editor", base.darkened(0.15))
+	var base := EditorTheme.color("font_color", "Editor", Color(0.95, 0.95, 1.0, 1.0))
+	var muted := EditorTheme.color("font_readonly_color", "Editor", base.darkened(0.15))
 	match kind:
 		"user":
 			return base
@@ -5208,8 +5040,8 @@ func _refresh_focus_indicator() -> void:
 
 	# Eye button is always there; its icon swaps with the include flag.
 	if focus_eye_button != null:
-		var eye_open := _editor_theme_icon("GuiVisibilityVisible")
-		var eye_closed := _editor_theme_icon("GuiVisibilityHidden")
+		var eye_open := EditorTheme.theme_icon("GuiVisibilityVisible")
+		var eye_closed := EditorTheme.theme_icon("GuiVisibilityHidden")
 		focus_eye_button.icon = eye_open if focus_include_enabled else eye_closed
 		focus_eye_button.tooltip_text = (
 			GodetteI18n.t("Focus node is INCLUDED in the next prompt — click to ignore")
@@ -5226,7 +5058,7 @@ func _refresh_focus_indicator() -> void:
 		# find the eye toggle. The eye still responds so the user can
 		# flip the include-preference even before picking a node.
 		focus_selected_node = null
-		focus_icon_rect.texture = _editor_theme_icon("Node")
+		focus_icon_rect.texture = EditorTheme.theme_icon("Node")
 		focus_path_label.text = GodetteI18n.t("No focus")
 		focus_path_label.tooltip_text = GodetteI18n.t("Select a node in the Scene Tree to attach it as context")
 		focus_indicator_container.modulate = Color(1, 1, 1, 0.45)
@@ -5272,7 +5104,7 @@ func _refresh_focus_indicator() -> void:
 	# Marching-ants ring animates only when the selection will actually
 	# be injected (node selected AND eye open). Eye-closed keeps the
 	# ring static so the animation doesn't compete with the dim modulate.
-	var accent: Color = _editor_color("accent_color", "Editor", Color(0.55, 0.78, 1.0, 1.0))
+	var accent: Color = EditorTheme.color("accent_color", "Editor", Color(0.55, 0.78, 1.0, 1.0))
 	focus_indicator_container.set_stroke_color(accent)
 	focus_indicator_container.set_active(focus_include_enabled)
 
@@ -5284,10 +5116,10 @@ func _refresh_composer_context() -> void:
 	# Keep overlay styling in step with the editor theme in case the user
 	# flips between dark / light themes at runtime.
 	composer_chip_overlay.set_chip_base_color(
-		_editor_color("base_color", "Editor", Color(0.22, 0.24, 0.28, 1.0)).lightened(0.08)
+		EditorTheme.color("base_color", "Editor", Color(0.22, 0.24, 0.28, 1.0)).lightened(0.08)
 	)
 	composer_chip_overlay.set_font_color(
-		_editor_color("font_color", "Editor", Color(0.97, 0.97, 0.995, 0.98))
+		EditorTheme.color("font_color", "Editor", Color(0.97, 0.97, 0.995, 0.98))
 	)
 
 	# The inline composer owns its own chip metadata — attach_paths /

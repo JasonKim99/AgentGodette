@@ -354,28 +354,37 @@ func _resolve_font_size() -> int:
 
 # Returns Array[Dictionary], one entry per line. Each entry is the
 # `{column: {color: Color, ...}}` dict the SyntaxHighlighter API exposes.
-# Empty dict for non-GDScript languages.
+# Empty dict for languages without a highlighter.
 func _compute_highlight_regions() -> Array:
 	var out: Array = []
-	if _language != "" and _language != "gdscript" and _language != "gd":
-		# Non-GDScript: skip highlighter, default-colour everything.
-		# Fill with empty dicts (rather than leaving null entries from
-		# `Array.resize`) so the consumer can treat every slot as a
-		# real Dictionary without null-guards.
-		var line_count: int = _code.count("\n") + 1
-		out.resize(line_count)
-		for i in range(line_count):
+	var line_count_total: int = _code.count("\n") + 1
+
+	# Pick a highlighter based on the fence's info string. Godot exposes
+	# `GDScriptSyntaxHighlighter` directly; for GDShader / compute we
+	# build a generic `CodeHighlighter` with keyword + type + built-in
+	# tables (the editor's shader editor does the same internally).
+	# Empty fence info defaults to GDScript since Godette runs inside
+	# the Godot editor.
+	var hl: SyntaxHighlighter = null
+	if _is_gdscript_language(_language):
+		hl = GDScriptSyntaxHighlighter.new()
+	elif _is_shader_language(_language):
+		hl = _make_shader_highlighter()
+
+	if hl == null:
+		# Unknown language → default-colour every line.
+		out.resize(line_count_total)
+		for i in range(line_count_total):
 			out[i] = {}
 		return out
 
-	# Standalone TextEdit + GDScriptSyntaxHighlighter. The TextEdit
-	# doesn't need to be in the scene tree for the highlighter to run;
-	# `get_line_syntax_highlighting` walks the highlighter against the
-	# TextEdit's text on demand. We build it once per finalize call and
-	# free it immediately after extracting the colour data.
+	# Standalone TextEdit drives the highlighter. The TextEdit doesn't
+	# need to be in the scene tree — `get_line_syntax_highlighting`
+	# walks the highlighter against the TextEdit's text on demand.
+	# We build it once per finalize call and free it immediately after
+	# extracting the colour data.
 	var te := TextEdit.new()
 	te.text = _code
-	var hl := GDScriptSyntaxHighlighter.new()
 	te.syntax_highlighter = hl
 	var line_count: int = te.get_line_count()
 	out.resize(line_count)
@@ -387,6 +396,211 @@ func _compute_highlight_regions() -> Array:
 		out[i] = info if info is Dictionary else {}
 	te.queue_free()
 	return out
+
+
+# ---------------------------------------------------------------------------
+# Language detection + shader highlighter
+# ---------------------------------------------------------------------------
+
+
+# GDScript / Godette's primary language. Empty fence info also defaults
+# here since we run inside the Godot editor and code-without-info-string
+# is overwhelmingly GDScript in this context.
+func _is_gdscript_language(lang: String) -> bool:
+	return lang == "" or lang == "gdscript" or lang == "gd"
+
+
+# GDShader (vertex / fragment / light / compute) and the GLSL synonym
+# users often type. Compute shaders share the same syntax as the
+# spatial / canvas variants — only the `shader_type compute;` directive
+# differs — so one highlighter covers all of them.
+func _is_shader_language(lang: String) -> bool:
+	return (
+		lang == "gdshader" or lang == "shader" or lang == "glsl"
+		or lang == "compute" or lang == "compute_shader" or lang == "cs"
+	)
+
+
+# Keyword tables for GDShader. Verbatim from Godot 4.6+'s
+# `ShaderLanguage::get_keyword_list()` (servers/rendering/shader_language.cpp)
+# and `ShaderPreprocessor::get_keyword_list()`. Splitting into "regular"
+# vs "control flow" mirrors what `editor/shader/text_shader_editor.cpp`
+# does — control-flow keywords go in `control_flow_keyword_color`, the
+# rest in `keyword_color`. Updating Godot may add new keywords; the lists
+# here drift over time.
+
+# `ShaderLanguage::is_control_flow_keyword(...)` returns true for these.
+static var _SHADER_CONTROL_FLOW: PackedStringArray = PackedStringArray([
+	"if", "else", "for", "while", "do", "switch", "case", "default",
+	"break", "continue", "return", "discard",
+])
+
+# All other keywords from `keyword_list` (storage qualifiers, types,
+# uniform hints, sampler filters, true/false literals, etc).
+static var _SHADER_KEYWORDS: PackedStringArray = PackedStringArray([
+	# Literals
+	"true", "false",
+	# Scalar / vector / matrix types
+	"void", "bool", "bvec2", "bvec3", "bvec4",
+	"int", "ivec2", "ivec3", "ivec4",
+	"uint", "uvec2", "uvec3", "uvec4",
+	"float", "vec2", "vec3", "vec4",
+	"mat2", "mat3", "mat4",
+	# Sampler types
+	"sampler2D", "isampler2D", "usampler2D",
+	"sampler2DArray", "isampler2DArray", "usampler2DArray",
+	"sampler3D", "isampler3D", "usampler3D",
+	"samplerCube", "samplerCubeArray", "samplerExternalOES",
+	# Storage / interpolation qualifiers
+	"flat", "smooth", "lowp", "mediump", "highp",
+	"uniform", "group_uniforms", "varying", "const", "struct",
+	"shader_type", "render_mode", "stencil_mode",
+	"instance", "global",
+	"in", "out", "inout",
+	# Uniform hints
+	"source_color", "color_conversion_disabled",
+	"hint_range", "hint_enum", "instance_index",
+	"hint_normal",
+	"hint_default_white", "hint_default_black", "hint_default_transparent",
+	"hint_anisotropy",
+	"hint_roughness_r", "hint_roughness_g", "hint_roughness_b", "hint_roughness_a",
+	"hint_roughness_normal", "hint_roughness_gray",
+	"hint_screen_texture", "hint_normal_roughness_texture", "hint_depth_texture",
+	"hint_blit_source0", "hint_blit_source1", "hint_blit_source2", "hint_blit_source3",
+	# Sampler filters / repeat hints
+	"filter_nearest", "filter_linear",
+	"filter_nearest_mipmap", "filter_linear_mipmap",
+	"filter_nearest_mipmap_anisotropic", "filter_linear_mipmap_anisotropic",
+	"repeat_enable", "repeat_disable",
+])
+
+# Verbatim from `ShaderPreprocessor::get_keyword_list`. Coloured the
+# same as control flow keywords (matches Godot's editor — preprocessor
+# directives share the control-flow-keyword colour).
+static var _SHADER_PREPROCESSOR: PackedStringArray = PackedStringArray([
+	"define", "defined", "elif", "else", "endif",
+	"error", "if", "ifdef", "ifndef",
+	"include", "pragma", "undef",
+])
+
+# Common built-in variables. Godot's editor pulls these from
+# `ShaderTypes::get_singleton()->get_functions(ShaderMode)` — that
+# class isn't exposed to GDScript, so this is a hand-curated union of
+# the most-used built-ins across spatial / canvas_item / particles /
+# sky / fog / compute modes. Less complete than the editor's per-mode
+# colourisation but covers the common cases.
+static var _SHADER_BUILTINS: PackedStringArray = PackedStringArray([
+	# Entry-point function names (per shader_type). Godot's editor
+	# pulls these from `ShaderTypes::get_functions(ShaderMode)` and
+	# colours them with `user_type_color` — same bucket as the
+	# `VERTEX` / `ALBEDO` style built-in variables, even though they
+	# look like function names in source.
+	"vertex", "fragment", "light",     # spatial / canvas_item
+	"start", "process",                # particles
+	"sky",                             # sky
+	"fog",                             # fog
+	"compute",                         # compute
+	# Common (vertex + fragment, 3D and 2D)
+	"VERTEX", "NORMAL", "TANGENT", "BINORMAL", "UV", "UV2", "COLOR",
+	"INSTANCE_ID", "VIEWPORT_SIZE", "TIME", "POINT_SIZE",
+	"POSITION", "MODULATE", "TEXTURE", "TEXTURE_PIXEL_SIZE",
+	# 3D matrices
+	"MODEL_MATRIX", "VIEW_MATRIX", "INV_VIEW_MATRIX",
+	"PROJECTION_MATRIX", "INV_PROJECTION_MATRIX",
+	"MODELVIEW_MATRIX", "MODELVIEW_NORMAL_MATRIX",
+	"WORLD_MATRIX", "EXTRA_MATRIX",
+	# Fragment (3D)
+	"ALBEDO", "METALLIC", "ROUGHNESS", "SPECULAR", "EMISSION", "ALPHA",
+	"NORMAL_MAP", "NORMAL_MAP_DEPTH",
+	"AO", "AO_LIGHT_AFFECT", "RIM", "RIM_TINT",
+	"CLEARCOAT", "CLEARCOAT_GLOSS", "ANISOTROPY", "ANISOTROPY_FLOW",
+	"SUBSURFACE_SCATTERING_STRENGTH", "TRANSMISSION", "BACKLIGHT",
+	"FRAGCOORD", "POINT_COORD", "FRONT_FACING", "DEPTH",
+	# Light pass
+	"LIGHT", "LIGHT_COLOR", "ATTENUATION",
+	"DIFFUSE_LIGHT", "SPECULAR_LIGHT",
+	# Compute shader
+	"GLOBAL_INVOCATION_ID", "LOCAL_INVOCATION_ID", "WORK_GROUP_ID",
+	"LOCAL_INVOCATION_INDEX", "NUM_WORK_GROUPS", "WORK_GROUP_SIZE",
+])
+
+
+# Build a CodeHighlighter pre-populated with GDShader keywords + control
+# flow keywords + preprocessor directives + built-ins. Colour mapping
+# matches `editor/shader/text_shader_editor.cpp`:
+#   - regular keywords  → keyword_color
+#   - control flow      → control_flow_keyword_color
+#   - preprocessor      → control_flow_keyword_color (same as control flow)
+#   - built-ins         → user_type_color
+#   - comments          → comment_color (+ doc_comment_color for /** */)
+#   - strings           → string_color
+# Colours pulled from EditorSettings so the result tracks the user's
+# editor theme (same source GDScriptSyntaxHighlighter uses).
+func _make_shader_highlighter() -> CodeHighlighter:
+	var hl := CodeHighlighter.new()
+
+	# Sensible fallbacks for when EditorInterface isn't reachable
+	# (running outside the editor — shouldn't happen for an editor
+	# plugin but keeps the function pure).
+	var keyword_color := Color(1.0, 0.44, 0.52)
+	var control_flow_color := Color(1.0, 0.5, 0.6)
+	var user_type_color := Color(0.42, 0.85, 1.0)
+	var function_color := Color(0.55, 0.78, 1.0)
+	var comment_color := Color(0.55, 0.6, 0.65)
+	var doc_comment_color := Color(0.65, 0.7, 0.75)
+	var string_color := Color(0.95, 0.85, 0.5)
+	var number_color := Color(0.92, 0.66, 0.85)
+	var symbol_color := Color(0.85, 0.88, 0.92)
+
+	if Engine.is_editor_hint():
+		var settings := EditorInterface.get_editor_settings()
+		if settings != null:
+			keyword_color = settings.get_setting("text_editor/theme/highlighting/keyword_color")
+			control_flow_color = settings.get_setting("text_editor/theme/highlighting/control_flow_keyword_color")
+			user_type_color = settings.get_setting("text_editor/theme/highlighting/user_type_color")
+			function_color = settings.get_setting("text_editor/theme/highlighting/function_color")
+			comment_color = settings.get_setting("text_editor/theme/highlighting/comment_color")
+			doc_comment_color = settings.get_setting("text_editor/theme/highlighting/doc_comment_color")
+			string_color = settings.get_setting("text_editor/theme/highlighting/string_color")
+			number_color = settings.get_setting("text_editor/theme/highlighting/number_color")
+			symbol_color = settings.get_setting("text_editor/theme/highlighting/symbol_color")
+
+	for kw in _SHADER_KEYWORDS:
+		hl.add_keyword_color(kw, keyword_color)
+	for kw in _SHADER_CONTROL_FLOW:
+		hl.add_keyword_color(kw, control_flow_color)
+	for kw in _SHADER_PREPROCESSOR:
+		hl.add_keyword_color(kw, control_flow_color)
+	for builtin in _SHADER_BUILTINS:
+		hl.add_keyword_color(builtin, user_type_color)
+
+	# Built-in math/texture functions (`texture`, `mix`, `smoothstep`,
+	# `clamp`, `dot`, `normalize`, …) aren't enumerated by Godot's
+	# editor either — `CodeHighlighter` auto-detects `name(` patterns
+	# and paints them with `function_color`. Same pipeline picks up
+	# user-defined functions for free. `number_color`, `symbol_color`,
+	# and `member_variable_color` are likewise property-based, not
+	# keyword-list based. Mirrors `text_shader_editor.cpp`.
+	hl.function_color = function_color
+	hl.number_color = number_color
+	hl.symbol_color = symbol_color
+	hl.member_variable_color = user_type_color
+
+	# Order matters when the start-tokens nest. `/**` must register
+	# before `/*` so the doc-comment region matches first; `/**/` is
+	# the empty-doc-comment edge case (line_only=true to terminate at
+	# end-of-line rather than scanning until next `*/`). Same order
+	# Godot's shader editor uses.
+	hl.add_color_region("/**", "*/", doc_comment_color, false)
+	hl.add_color_region("/**/", "", comment_color, true)
+	hl.add_color_region("/*", "*/", comment_color, false)
+	hl.add_color_region("//", "", comment_color, true)
+	hl.add_color_region("\"", "\"", string_color, false)
+
+	hl.symbol_color = symbol_color
+	hl.number_color = number_color
+
+	return hl
 
 
 # Convert one line's `{column: {color: Color}}` dict into ordered
