@@ -4152,7 +4152,7 @@ func _adapter_candidates(agent_id: String) -> Array:
 			if FileAccess.file_exists(claude_js):
 				candidates.append({"path": "node", "args": PackedStringArray([claude_js])})
 			if not cmd_exe.is_empty() and FileAccess.file_exists(npx_cmd):
-				candidates.append({"path": cmd_exe, "args": PackedStringArray(["/d", "/c", npx_cmd, "-y", "@agentclientprotocol/claude-agent-acp@0.30.0"])})
+				candidates.append({"path": cmd_exe, "args": PackedStringArray(["/d", "/c", npx_cmd, "-y", "@agentclientprotocol/claude-agent-acp@0.31.0"])})
 		else:
 			var codex_global_cmd := npm_root.path_join("codex-acp.cmd")
 			if not cmd_exe.is_empty() and FileAccess.file_exists(codex_global_cmd):
@@ -4161,17 +4161,17 @@ func _adapter_candidates(agent_id: String) -> Array:
 			if FileAccess.file_exists(codex_js):
 				candidates.append({"path": "node", "args": PackedStringArray([codex_js])})
 			if not cmd_exe.is_empty() and FileAccess.file_exists(npx_cmd):
-				candidates.append({"path": cmd_exe, "args": PackedStringArray(["/d", "/c", npx_cmd, "-y", "@zed-industries/codex-acp@0.11.1"])})
+				candidates.append({"path": cmd_exe, "args": PackedStringArray(["/d", "/c", npx_cmd, "-y", "@zed-industries/codex-acp@0.12.0"])})
 		return candidates
 
 	if agent_id == "claude_agent":
 		candidates.append({"path": "claude-code-acp", "args": PackedStringArray()})
 		candidates.append({"path": "npx", "args": PackedStringArray(["-y", "@zed-industries/claude-code-acp@0.16.2"])})
 		candidates.append({"path": "claude-agent-acp", "args": PackedStringArray()})
-		candidates.append({"path": "npx", "args": PackedStringArray(["-y", "@agentclientprotocol/claude-agent-acp@0.30.0"])})
+		candidates.append({"path": "npx", "args": PackedStringArray(["-y", "@agentclientprotocol/claude-agent-acp@0.31.0"])})
 	else:
 		candidates.append({"path": "codex-acp", "args": PackedStringArray()})
-		candidates.append({"path": "npx", "args": PackedStringArray(["-y", "@zed-industries/codex-acp@0.11.1"])})
+		candidates.append({"path": "npx", "args": PackedStringArray(["-y", "@zed-industries/codex-acp@0.12.0"])})
 	return candidates
 
 
@@ -5784,8 +5784,8 @@ func _normalized_models(session: Dictionary):
 		return {
 			"currentModelId": str(session.get("current_model_id", "default")),
 			"availableModels": [
-				{"modelId": "default", "name": "Default (recommended)", "description": "Opus 4.6 - Most capable for complex work"},
-				{"modelId": "sonnet", "name": "Sonnet", "description": "Sonnet 4.5 - Best for everyday tasks"},
+				{"modelId": "default", "name": "Default (recommended)", "description": "Opus 4.7 - Most capable for complex work"},
+				{"modelId": "sonnet", "name": "Sonnet", "description": "Sonnet 4.6 - Best for everyday tasks"},
 				{"modelId": "haiku", "name": "Haiku", "description": "Haiku 4.5 - Fastest for quick answers"}
 			]
 		}

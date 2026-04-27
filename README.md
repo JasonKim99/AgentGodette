@@ -33,15 +33,70 @@ Godot had no in-editor agent. This plugin makes the editor itself the chat surfa
 
 ## Requirements
 
-[Node.js](https://nodejs.org) 18+ is required to run the local ACP adapters. Install the adapters you want to use:
+[Node.js](https://nodejs.org) 18+ is required to run the local ACP adapters. Recommended install:
 
 ```bash
-npm install -g @zed-industries/claude-code-acp @zed-industries/codex-acp
+npm install -g @agentclientprotocol/claude-agent-acp @zed-industries/codex-acp
 ```
 
 The plugin also falls back to `npx -y <package>` on first run, so global install is optional — it just avoids the one-time download and works offline afterwards.
 
-Each adapter handles its own authentication: [claude-code-acp](https://github.com/zed-industries/claude-code-acp) uses the Claude CLI login, [codex-acp](https://github.com/zed-industries/codex-acp) uses the OpenAI Codex CLI login. Run either CLI once outside Godot to sign in.
+### Picking a Claude adapter
+
+Two ACP adapters can speak Claude. The dock auto-detects whichever you have installed; both are supported.
+
+| Adapter | Maintainer | Notes |
+|---|---|---|
+| **[`@agentclientprotocol/claude-agent-acp`](https://www.npmjs.com/package/@agentclientprotocol/claude-agent-acp)** *(recommended)* | Anthropic | Tracks the Claude SDK closely. Model strings like "Opus 4.7 with 1M context" stay fresh. |
+| [`@zed-industries/claude-code-acp`](https://github.com/zed-industries/claude-code-acp) | Zed | Wraps the Claude CLI. Works fine, but pins an older Claude SDK so model descriptions lag a release or two behind. |
+
+### Picking a Codex adapter
+
+Only one production option here. OpenAI hasn't published an official ACP adapter, and `@agentclientprotocol/codex-acp` is still pre-1.0 / experimental.
+
+| Adapter | Maintainer | Notes |
+|---|---|---|
+| **[`@zed-industries/codex-acp`](https://github.com/zed-industries/codex-acp)** *(recommended)* | Zed | The de facto Codex ACP adapter. |
+
+### Authentication
+
+Each adapter handles its own login. Run the underlying CLI **once outside Godot** to sign in:
+
+- `claude-agent-acp` / `claude-code-acp` → Claude CLI login
+- `codex-acp` → OpenAI Codex CLI login
+
+## Updating to newer models
+
+Model names and descriptions ("Opus 4.7", "GPT-5.4 / xhigh", …) are sent by the ACP adapter, **not hardcoded in this plugin**. So when Anthropic / OpenAI ship a new model, what surfaces in the dock depends on which adapter version is running on your machine.
+
+### How the dock picks an adapter
+
+The dock probes in this order and uses the first one that exists:
+
+1. Globally installed adapter (`npm install -g …`)
+2. Adapter found in your local Zed install (if you have Zed)
+3. `npx -y <pkg>@<version>` — the **plugin pins a specific version here**, which is what makes plugin builds reproducible
+
+The plugin pins are bumped each release. If you want fresher model strings without waiting for a plugin release, just bypass the pin by installing the adapter globally — option 1 wins.
+
+### Refreshing model strings
+
+```bash
+# Claude (Anthropic official)
+npm install -g @agentclientprotocol/claude-agent-acp@latest
+
+# or Claude (Zed adapter — note: SDK is intentionally older here)
+npm install -g @zed-industries/claude-code-acp@latest
+
+# Codex
+npm install -g @zed-industries/codex-acp@latest
+```
+
+Then **start a new thread** in the dock — existing threads keep whatever model list was cached when they were first created. The new thread will get the fresh strings.
+
+### Why two projects can disagree
+
+Each Godot project carries its own copy of `addons/godette_agent/`. If project A has the latest plugin (newer pin) and project B has an older plugin (older pin), they'll show different model descriptions even on the same machine. To unify them: update the plugin in both projects (AssetLib re-download, git pull, or just copy the folder over) — or globally install the adapter so the pin doesn't matter.
 
 ## Credits
 
