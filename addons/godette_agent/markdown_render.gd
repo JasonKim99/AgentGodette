@@ -103,6 +103,12 @@ static func render_events(events: Array, ctx: Dictionary) -> Control:
 	selection_manager.name = "MarkdownSelectionManager"
 	root.add_child(selection_manager)
 	ctx["selection_manager"] = selection_manager
+	# Running counter used to thread one logical 1./2./3./… enumeration
+	# across multiple ordered-list blocks separated by unindented body
+	# paragraphs (the "1./1./1./1." LLM-output idiom). 0 = no recent
+	# ordered list, so the next one starts at 1. Bumped on `end list`,
+	# reset on block-level breaks (heading / code / table / rule / quote).
+	ctx["running_ordered_count"] = 0
 
 	# Stack of frames, each describing one open block. Fields:
 	#   tag          — matches the parser tag (paragraph, table, …)
@@ -119,7 +125,7 @@ static func render_events(events: Array, ctx: Dictionary) -> Control:
 			"start":
 				_handle_start(ev, stack, ctx)
 			"end":
-				_handle_end(ev, stack)
+				_handle_end(ev, stack, ctx)
 			"text":
 				_handle_text(ev, stack, ctx)
 			"rule":
@@ -167,6 +173,14 @@ static func _current_container(stack: Array) -> Control:
 
 static func _handle_start(ev: Dictionary, stack: Array, ctx: Dictionary) -> void:
 	var tag: String = str(ev.get("tag", ""))
+	# Hard block-level boundaries reset the running ordered-list counter
+	# so a `1./2./…` enumeration after a heading / code block / table /
+	# blockquote starts at 1 again, not as a continuation. `paragraph`
+	# is intentionally omitted — that's the LLM-style break we want to
+	# bridge across.
+	match tag:
+		"heading", "code_block", "table", "blockquote":
+			ctx["running_ordered_count"] = 0
 	match tag:
 		"paragraph":
 			var tb := _make_textblock(ctx)
@@ -251,7 +265,18 @@ static func _handle_start(ev: Dictionary, stack: Array, ctx: Dictionary) -> void
 			list_block.set_font_size(int(ctx["base_font_size"]))
 			list_block.set_line_spacing(float(ctx["line_spacing"]))
 			list_block.set_selection_color(ctx["selection_color"])
-			list_block.set_ordered(bool(ev.get("ordered", false)))
+			var list_ordered: bool = bool(ev.get("ordered", false))
+			list_block.set_ordered(list_ordered)
+			# Continuation of a previous ordered list (LLM idiom: a chain of
+			# `1.` headings broken up by unindented body paragraphs). The
+			# running counter is non-zero only when the *immediately* prior
+			# ordered list ended cleanly without a hard block break in
+			# between (heading / code / table / rule); paragraphs don't
+			# reset it. See ctx["running_ordered_count"] init above.
+			var list_start_index: int = 1
+			if list_ordered and int(ctx.get("running_ordered_count", 0)) > 0:
+				list_start_index = int(ctx["running_ordered_count"]) + 1
+				list_block.set_start_index(list_start_index)
 
 			var indent := MarginContainer.new()
 			indent.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -271,7 +296,8 @@ static func _handle_start(ev: Dictionary, stack: Array, ctx: Dictionary) -> void
 				"container": indent,
 				"text_target": list_block,
 				"list_block": list_block,
-				"ordered": bool(ev.get("ordered", false)),
+				"ordered": list_ordered,
+				"start_index": list_start_index,
 			})
 
 		"list_item":
@@ -351,7 +377,7 @@ static func _handle_start(ev: Dictionary, stack: Array, ctx: Dictionary) -> void
 			stack.append({"tag": tag, "container": null, "text_target": null})
 
 
-static func _handle_end(ev: Dictionary, stack: Array) -> void:
+static func _handle_end(ev: Dictionary, stack: Array, ctx: Dictionary) -> void:
 	if stack.size() <= 1:
 		return
 	var expected: String = str(ev.get("tag", ""))
@@ -365,6 +391,16 @@ static func _handle_end(ev: Dictionary, stack: Array) -> void:
 		var lb_v = enclosing.get("list_block", null)
 		if lb_v != null and is_instance_valid(lb_v) and lb_v.has_method("end_item"):
 			lb_v.end_item()
+	# Carry the ordered-list counter into the next ordered list iff the
+	# only thing between them is paragraphs. A `list ordered` end → write
+	# the running total back to ctx. Block-level breaks (heading / code /
+	# table / rule) reset the counter at their *start* in _handle_start;
+	# here we only need to update on list end.
+	if expected == "list" and bool(top.get("ordered", false)):
+		var lb_end = top.get("list_block", null)
+		if lb_end != null and is_instance_valid(lb_end) and lb_end.has_method("item_count"):
+			var s_idx: int = int(top.get("start_index", 1))
+			ctx["running_ordered_count"] = s_idx + int(lb_end.item_count()) - 1
 	# Route 3 (tables): notify the enclosing TableBlock of cell / row
 	# completion so it can flush its incremental builder state.
 	if expected == "table_cell":
@@ -441,6 +477,9 @@ static func _emit_break(stack: Array, char_: String) -> void:
 
 
 static func _emit_rule(stack: Array, ctx: Dictionary) -> void:
+	# Horizontal rules are a hard block break — see _handle_start for the
+	# matching reset on heading/code/table/blockquote.
+	ctx["running_ordered_count"] = 0
 	var wrapper := MarginContainer.new()
 	wrapper.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	wrapper.add_theme_constant_override("margin_top", RULE_VERTICAL_PAD)

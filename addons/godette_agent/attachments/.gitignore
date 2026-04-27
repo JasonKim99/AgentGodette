@@ -1,0 +1,7 @@
+# Godette stores clipboard pastes + drag-dropped blobs here. Per-machine
+# scratch, not project content — never commit. This .gitignore ships with
+# the plugin so every project that installs Godette gets the rule for
+# free, without the user having to add it to their root .gitignore.
+*
+!.gitignore
+!.gdignore

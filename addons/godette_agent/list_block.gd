@@ -55,6 +55,14 @@ const ITEM_GAP_PX: float = 2.0
 # item; each inner entry is a styled run with the same shape TextBlock.set_spans
 # accepts (text, font, font_size, bg).
 var _ordered: bool = false
+# First marker number for ordered lists. Default 1 (CommonMark — every list
+# starts at 1 unless its first marker says otherwise). Bumped above 1 when
+# markdown_render detects a "continuation" — i.e. an LLM-style transcript
+# that breaks one logical 1./2./3./4. enumeration into multiple separate
+# `1.` lists separated by unindented body paragraphs. Without this the
+# enumerated headings all render as "1." (per strict CommonMark, but
+# wrong against author intent — see design/drawer_composer_optimizations.md).
+var _start_index: int = 1
 var _items_spans: Array = []  # Array[Array[Dictionary]]
 
 var _font: Font = null
@@ -121,6 +129,22 @@ func set_ordered(value: bool) -> void:
 		return
 	_ordered = value
 	queue_redraw()
+
+
+func set_start_index(value: int) -> void:
+	var clamped: int = max(1, value)
+	if _start_index == clamped:
+		return
+	_start_index = clamped
+	queue_redraw()
+
+
+func item_count() -> int:
+	# Used by markdown_render to thread the running counter from one
+	# ordered-list block into the next (only when the gap between them
+	# is just paragraph text, not a hard block-level break).
+	var live_extra: int = 1 if not _building_item.is_empty() else 0
+	return _items_spans.size() + live_extra
 
 
 func begin_item() -> void:
@@ -614,7 +638,7 @@ func _draw_marker(canvas: RID, item_index: int, y_top: float) -> void:
 	if font == null:
 		return
 	var size_px: int = _effective_font_size()
-	var marker_text: String = "•" if not _ordered else ("%d." % (item_index + 1))
+	var marker_text: String = "•" if not _ordered else ("%d." % (item_index + _start_index))
 	var line := TextLine.new()
 	line.add_string(marker_text, font, size_px)
 	# Right-align the marker within the bullet column so longer numbers

@@ -31,5 +31,10 @@ desktop.ini
 *.orig
 
 # Godette: pasted clipboard images + drag-dropped blobs. Per-machine
-# scratch, not project content.
-/addons/godette_agent/attachments/
+# scratch, not project content. The attachments/ folder also ships with
+# its own .gitignore so end-user projects get the rule automatically;
+# this entry keeps the dev repo clean while still tracking the folder's
+# .gitignore + .gdignore.
+/addons/godette_agent/attachments/*
+!/addons/godette_agent/attachments/.gitignore
+!/addons/godette_agent/attachments/.gdignore
