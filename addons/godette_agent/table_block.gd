@@ -687,11 +687,15 @@ func _draw_paragraph_range_rect(
 		var overlap_end: int = min(e, line_end)
 		var line_rid: RID = paragraph.get_line_rid(line_idx)
 		var continues_to_next_line: bool = e > line_end
+		# Paragraph-global char indices — `paragraph.get_line_rid()` shares
+		# the paragraph's shaped text, so subtracting `line_start` queries
+		# the wrong line. See the matching comment in text_block.gd /
+		# list_block.gd for the symptom (line 2+ rects collapse to width 0).
 		var start_x: float
 		if overlap_start == line_start:
 			start_x = 0.0
 		else:
-			start_x = _line_char_x_local(line_rid, overlap_start - line_start, line_size.x, false)
+			start_x = _line_char_x_local(line_rid, overlap_start, line_size.x, false)
 		var end_x: float
 		# For selection rects: also snap to line_size.x when the range
 		# ends exactly at line_end (degenerate caret rect workaround,
@@ -700,7 +704,7 @@ func _draw_paragraph_range_rect(
 		if continues_to_next_line or (not is_chip and overlap_end == line_end):
 			end_x = line_size.x
 		else:
-			end_x = _line_char_x_local(line_rid, overlap_end - line_start, line_size.x, true)
+			end_x = _line_char_x_local(line_rid, overlap_end, line_size.x, true)
 		if end_x <= start_x:
 			y_cursor += row_advance
 			continue
@@ -936,8 +940,10 @@ func _hit_test_char_in_paragraph(paragraph: TextParagraph, local_pos: Vector2) -
 			if ts == null:
 				return line_range.x
 			var line_rid: RID = paragraph.get_line_rid(line_idx)
-			var char_in_line: int = ts.shaped_text_hit_test_position(line_rid, local_pos.x)
-			var result: int = line_range.x + char_in_line
+			# `shaped_text_hit_test_position` returns paragraph-global
+			# char index. Don't add line_range.x — see text_block.gd
+			# `_hit_test_char` for the bug this caused on wrapped lines.
+			var result: int = ts.shaped_text_hit_test_position(line_rid, local_pos.x)
 			return clamp(result, line_range.x, line_range.y)
 		y_cursor = line_bottom
 	if line_count > 0:

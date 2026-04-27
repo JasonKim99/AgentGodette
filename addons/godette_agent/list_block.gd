@@ -406,18 +406,20 @@ func _draw_paragraph_range_rect(paragraph: TextParagraph, s: int, e: int, color:
 		var overlap_start: int = max(s, line_start)
 		var overlap_end: int = min(e, line_end)
 		var line_rid: RID = paragraph.get_line_rid(line_idx)
+		# Paragraph-global char indices — see `_draw_paragraph_selection_rect`
+		# for why we don't subtract `line_start` here.
 		var start_x: float
 		if overlap_start == line_start:
 			start_x = 0.0
 		else:
-			start_x = _line_char_x_local(line_rid, overlap_start - line_start, line_size.x, false)
+			start_x = _line_char_x_local(line_rid, overlap_start, line_size.x, false)
 		var end_x: float
 		# Range continues onto the next line: extend to this line's
 		# content right edge so the chip looks unbroken across the wrap.
 		if e > line_end:
 			end_x = line_size.x
 		else:
-			end_x = _line_char_x_local(line_rid, overlap_end - line_start, line_size.x, true)
+			end_x = _line_char_x_local(line_rid, overlap_end, line_size.x, true)
 		if end_x <= start_x:
 			y_cursor += row_advance
 			continue
@@ -466,16 +468,24 @@ func _draw_paragraph_selection_rect(paragraph: TextParagraph, s: int, e: int, co
 		var overlap_end: int = min(e, line_end)
 		var line_rid: RID = paragraph.get_line_rid(line_idx)
 		var continues_to_next_line: bool = e > line_end
+		# `paragraph.get_line_rid()` returns the paragraph's own shaped-
+		# text rid; all char indices passed to `shaped_text_get_carets` /
+		# `shaped_text_hit_test_position` are PARAGRAPH-GLOBAL, but the x
+		# coords come back LINE-LOCAL (relative to the line's own left
+		# edge). So we must NOT subtract `line_start` from the char index
+		# — passing a small line-local value queries paragraph char N,
+		# which on a wrapped line lives on line 1 and silently returns
+		# line 1's x, breaking line 2's selection draw.
 		var start_x: float
 		if overlap_start == line_start:
 			start_x = 0.0
 		else:
-			start_x = _line_char_x_local(line_rid, overlap_start - line_start, line_size.x, false)
+			start_x = _line_char_x_local(line_rid, overlap_start, line_size.x, false)
 		var end_x: float
 		if continues_to_next_line or overlap_end == line_end:
 			end_x = line_size.x
 		else:
-			end_x = _line_char_x_local(line_rid, overlap_end - line_start, line_size.x, true)
+			end_x = _line_char_x_local(line_rid, overlap_end, line_size.x, true)
 		if end_x <= start_x:
 			y_cursor += row_advance
 			continue
@@ -508,7 +518,15 @@ func _line_char_x_local(line_rid: RID, char_in_line: int, line_width: float, is_
 		if not (rect_variant is Rect2):
 			rect_variant = info.get("leading_rect", null)
 		if rect_variant is Rect2:
-			return clamp((rect_variant as Rect2).position.x, 0.0, line_width)
+			var r: Rect2 = rect_variant as Rect2
+			# Degenerate result guard: when shaped_text_get_carets returns
+			# x=0 for char_in_line > 0 (happens with certain CJK + bold +
+			# wrap shaping configs), fall through to the glyph-iteration
+			# branch below. Without this, partial selection rects on
+			# wrapped continuation lines collapse to zero width and the
+			# whole line silently drops out of the selection highlight.
+			if r.position.x > 0.0 or r.size.x > 0.0:
+				return clamp(r.position.x, 0.0, line_width)
 	var glyphs: Array = ts.shaped_text_get_glyphs(line_rid)
 	var x_accum: float = 0.0
 	for glyph_variant in glyphs:
@@ -976,14 +994,27 @@ func _hit_test_char_in_paragraph(paragraph: TextParagraph, local_pos: Vector2) -
 			if ts == null:
 				return line_range.x
 			var line_rid: RID = paragraph.get_line_rid(line_idx)
-			var char_in_line: int = ts.shaped_text_hit_test_position(line_rid, local_pos.x)
-			var result: int = line_range.x + char_in_line
+			# `shaped_text_hit_test_position` on a wrapped line's RID
+			# returns a PARAGRAPH-global char index (not line-local), so
+			# we use the result directly. Earlier code did
+			# `line_range.x + char_in_line`, which double-counted the line
+			# offset and silently clamped focus_char to line_range.y on
+			# every motion — partial drag highlights collapsed to the
+			# anchor's position.
+			var result: int = ts.shaped_text_hit_test_position(line_rid, local_pos.x)
 			return clamp(result, line_range.x, line_range.y)
 		y_cursor = line_bottom
-	# Past the last line — clamp to end of paragraph text length.
-	if line_count > 0:
-		var last_range: Vector2i = paragraph.get_line_range(line_count - 1)
-		return last_range.y
+	# Past the last line. Don't blanket-return end-of-paragraph — see
+	# text_block.gd `_hit_test_char` for why (drag y dipping into the
+	# row's bottom padding would otherwise snap selection to the item's
+	# last char). Treat as "on the last line, use cursor x". The
+	# returned index is already paragraph-global (see comment above).
+	if line_count > 0 and ts != null:
+		var last_idx: int = line_count - 1
+		var last_range: Vector2i = paragraph.get_line_range(last_idx)
+		var last_rid: RID = paragraph.get_line_rid(last_idx)
+		var last_result: int = ts.shaped_text_hit_test_position(last_rid, local_pos.x)
+		return clamp(last_result, last_range.x, last_range.y)
 	return 0
 
 

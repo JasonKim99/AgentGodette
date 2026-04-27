@@ -569,11 +569,17 @@ func _draw_range_rect(s: int, e: int, color: Color) -> void:
 		var overlap_start: int = max(s, line_start)
 		var overlap_end: int = min(e, line_end)
 		var line_rid: RID = _paragraph.get_line_rid(line_idx)
+		# Paragraph-global char indices: `paragraph.get_line_rid()` shares
+		# the paragraph's shaped-text rid, so `shaped_text_get_carets` /
+		# `shaped_text_hit_test_position` index into the full paragraph
+		# while returning line-local x. Subtracting `line_start` would
+		# query a different line's char and silently misplace rects on
+		# wrapped continuation lines.
 		var start_x: float
 		if overlap_start == line_start:
 			start_x = 0.0
 		else:
-			start_x = _line_char_x(line_rid, overlap_start - line_start, line_size.x, false)
+			start_x = _line_char_x(line_rid, overlap_start, line_size.x, false)
 		var end_x: float
 		# Range continues onto the next line: extend to this line's content
 		# right edge so the chip looks unbroken across the wrap. Same pattern
@@ -581,7 +587,7 @@ func _draw_range_rect(s: int, e: int, color: Color) -> void:
 		if e > line_end:
 			end_x = line_size.x
 		else:
-			end_x = _line_char_x(line_rid, overlap_end - line_start, line_size.x, true)
+			end_x = _line_char_x(line_rid, overlap_end, line_size.x, true)
 		if end_x <= start_x:
 			y_cursor += row_advance
 			continue
@@ -644,7 +650,8 @@ func _draw_selection_rects() -> void:
 			# anchor the highlight to x=0 so it reads as "whole line".
 			start_x = 0.0
 		else:
-			start_x = _line_char_x(line_rid, overlap_start - line_start, line_size.x, false)
+			# Paragraph-global char index — see the chip-bg branch above.
+			start_x = _line_char_x(line_rid, overlap_start, line_size.x, false)
 
 		var end_x: float
 		if continues_to_next_line or overlap_end == line_end:
@@ -665,7 +672,7 @@ func _draw_selection_rects() -> void:
 			# entirely. Snapping to `line_size.x` bypasses that quirk.
 			end_x = line_size.x
 		else:
-			end_x = _line_char_x(line_rid, overlap_end - line_start, line_size.x, true)
+			end_x = _line_char_x(line_rid, overlap_end, line_size.x, true)
 
 		# Empty selected line: line_size.x is 0 so there's nothing to
 		# highlight via char positions. Draw a small marker block so the
@@ -713,7 +720,14 @@ func _line_char_x(line_rid: RID, char_in_line: int, line_width: float, is_end: b
 			# collapse to the same caret) only populate `leading_rect`.
 			rect_variant = info.get("leading_rect", null)
 		if rect_variant is Rect2:
-			return clamp((rect_variant as Rect2).position.x, 0.0, line_width)
+			var r: Rect2 = rect_variant as Rect2
+			# Degenerate result guard: when shaped_text_get_carets returns
+			# x=0 for char_in_line > 0 (CJK + bold + wrap shaping edge
+			# cases), fall through to the glyph-iteration branch below.
+			# Without this, partial selection on wrapped continuation
+			# lines collapses to zero width and disappears.
+			if r.position.x > 0.0 or r.size.x > 0.0:
+				return clamp(r.position.x, 0.0, line_width)
 
 	# Fallback: sum glyph advances up to `char_in_line`. Each glyph dict
 	# carries `start` (char index in the shaped text) and `advance`
@@ -1070,11 +1084,30 @@ func _hit_test_char(local_pos: Vector2) -> int:
 			if ts == null:
 				return line_range.x
 			var line_rid: RID = _paragraph.get_line_rid(line_idx)
-			var char_in_line: int = ts.shaped_text_hit_test_position(line_rid, local_pos.x)
-			var result: int = line_range.x + char_in_line
+			# `shaped_text_hit_test_position` on a wrapped line's RID
+			# returns a PARAGRAPH-global char index (not line-local), so
+			# we use the result directly. The previous
+			# `line_range.x + char_in_line` double-counted the line
+			# offset; on wrapped continuation lines this collapsed every
+			# drag focus to the line's last char (= entire-line / entire-
+			# paragraph selection on partial drags).
+			var result: int = ts.shaped_text_hit_test_position(line_rid, local_pos.x)
 			return clamp(result, line_range.x, line_range.y)
 		y_cursor = line_bottom
 
-	# Past the last line — clamp to end of text so a drag below the
-	# TextBlock extends selection to the final character.
+	# Past the last line. Don't blanket-return _text.length() — a drag
+	# whose y dipped a few pixels into the block's bottom padding (line
+	# spacing, container-expanded height, separation gap) would then
+	# snap selection to the final character even when x is clearly over
+	# a specific glyph. Instead, treat this as "on the last line, use
+	# the cursor's x" so the result still tracks horizontal position.
+	# x past the rendered text on that line still clamps to line end
+	# (standard editor behavior), but x within it resolves correctly.
+	if line_count > 0 and ts != null:
+		var last_idx: int = line_count - 1
+		var last_range: Vector2i = _paragraph.get_line_range(last_idx)
+		var last_rid: RID = _paragraph.get_line_rid(last_idx)
+		# Already paragraph-global — see comment in the in-loop branch.
+		var last_result: int = ts.shaped_text_hit_test_position(last_rid, local_pos.x)
+		return clamp(last_result, last_range.x, last_range.y)
 	return _text.length()
