@@ -245,10 +245,27 @@ func _update_drag_focus(global_pos: Vector2) -> void:
 	if target == null:
 		# Cursor between two blocks (or in a gap the hit_area doesn't
 		# cover — horizontal margins, inter-paragraph separation, etc.).
-		# Find the nearest valid block by vertical distance and snap to
-		# its top/bottom edge depending on which side the cursor is on.
+		# Find the nearest valid block by vertical distance.
+		#
+		# Three cases per candidate:
+		#   - cursor above its top  → snap to char 0   (above=true)
+		#   - cursor below its bot  → snap to text end (above=false)
+		#   - Y inside, X outside   → cursor is on this block's row
+		#                              (a narrow text block + wide chat
+		#                              panel leaves whitespace either
+		#                              side). Run a real hit_test on the
+		#                              row's y, clamped x — that gives a
+		#                              char position INSIDE the visible
+		#                              text instead of jumping to the
+		#                              block's terminal char (which used
+		#                              to make the whole block flash as
+		#                              "selected" the moment a drag
+		#                              passed through any horizontal
+		#                              padding).
 		var best_dist: float = INF
 		var best_above: bool = false
+		var best_in_row: bool = false
+		var best_rect: Rect2 = Rect2()
 		for i in range(_blocks.size()):
 			var b = _blocks[i]
 			if not is_instance_valid(b):
@@ -260,6 +277,7 @@ func _update_drag_focus(global_pos: Vector2) -> void:
 			var bottom: float = top + rect.size.y
 			var dist: float
 			var above: bool
+			var in_row: bool = false
 			if global_pos.y < top:
 				dist = top - global_pos.y
 				above = true
@@ -267,17 +285,27 @@ func _update_drag_focus(global_pos: Vector2) -> void:
 				dist = global_pos.y - bottom
 				above = false
 			else:
-				# Y is in range but x wasn't — treat as "in this block's
-				# row", clamp char based on x side.
 				dist = 0.0
-				above = global_pos.x < rect.position.x
+				above = false
+				in_row = true
 			if dist < best_dist:
 				best_dist = dist
 				target = b
 				best_above = above
+				best_in_row = in_row
+				best_rect = rect
 		if target == null:
 			return
-		if best_above:
+		if best_in_row:
+			# Hit-test inside the row using the cursor's actual y plus a
+			# clamped x (so X just outside the block resolves to that
+			# row's leftmost / rightmost char, not the block's textual
+			# end). hit_test_char handles its own line walk; we just
+			# need to feed it coords inside `target`'s local space.
+			var clamped_x: float = clamp(global_pos.x, best_rect.position.x, best_rect.position.x + best_rect.size.x - 1.0)
+			var local_in_row: Vector2 = Vector2(clamped_x, global_pos.y) - target.global_position
+			target_char_override = target.hit_test_char(local_in_row)
+		elif best_above:
 			target_char_override = 0
 		else:
 			target_char_override = target.get_text().length()
