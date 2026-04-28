@@ -25,6 +25,7 @@ const LoadingScannerScript = preload("res://addons/godette_agent/loading_scanner
 const ComposerContextScript = preload("res://addons/godette_agent/composer_context.gd")
 const ComposerPromptInputScript = preload("res://addons/godette_agent/composer_prompt_input.gd")
 const ComposerChipOverlayScript = preload("res://addons/godette_agent/composer_chip_overlay.gd")
+const ComposerSlashPopupScript = preload("res://addons/godette_agent/composer_slash_popup.gd")
 const EditorTheme = preload("res://addons/godette_agent/editor_theme.gd")
 # Store pasted images under the addon itself so every generated attachment
 # stays in one predictable project-local place. Keep the directory visible
@@ -101,6 +102,12 @@ var queue_expanded_sessions: Dictionary = {}
 var prompt_input: TextEdit
 var composer_options_bar: HBoxContainer
 var composer_chip_overlay: GodetteComposerChipOverlay
+# Slash command picker. Pops up next to the composer when the user types
+# `/` at the start of the prompt; populated from
+# `session.available_commands` (delivered via ACP available_commands_update).
+# Typed as PopupPanel so the editor can resolve it without depending on
+# class_name indexing of GodetteComposerSlashPopup.
+var composer_slash_popup: PopupPanel
 # Scene Tree focus indicator — tracks the user's current SceneTree
 # selection and optionally injects that node as implicit context into
 # the next prompt. Eye toggle decides whether the context is sent.
@@ -574,6 +581,15 @@ func _build_ui() -> void:
 	composer_chip_overlay = ComposerChipOverlayScript.new(typed_prompt)
 	composer_chip_overlay.chip_activated.connect(Callable(self, "_on_attachment_activated"))
 	prompt_input.add_child(composer_chip_overlay)
+
+	# Slash-command picker. Popup is attached to dock (not composer)
+	# so it can render above the composer rect when there's room. It
+	# tracks the composer's text_changed signal to decide when to
+	# show / filter / hide.
+	composer_slash_popup = ComposerSlashPopupScript.new()
+	composer_slash_popup.command_chosen.connect(Callable(self, "_on_slash_command_chosen"))
+	add_child(composer_slash_popup)
+	prompt_input.text_changed.connect(Callable(self, "_on_composer_text_changed_for_slash"))
 
 	var composer_section := VBoxContainer.new()
 	composer_section.add_theme_constant_override("separation", 6)
@@ -6834,6 +6850,99 @@ func _attachments_has_key(current_attachments: Array, key: String) -> bool:
 		if str(attachment.get("key", "")) == key:
 			return true
 	return false
+
+
+# Slash-command picker driver. Each composer text_changed checks whether
+# the typed text is a slash-command prefix (`/...` with no leading text /
+# chips); if so, refreshes the popup with the active session's
+# `available_commands`, filtered by the partial typed name. Otherwise
+# closes the popup. Hidden when no commands are available.
+func _on_composer_text_changed_for_slash() -> void:
+	if composer_slash_popup == null or prompt_input == null:
+		return
+	if current_session_index < 0 or current_session_index >= _state.sessions.size():
+		composer_slash_popup.close_popup()
+		return
+	# Slash-prefix detection. We only show when:
+	#   - the prompt text begins with `/`
+	#   - there are no chips in front of it (otherwise the slash isn't
+	#     "the start" of the message in any user-visible sense)
+	#   - the prompt has no whitespace yet (i.e. user is still typing
+	#     the command name; once they hit space they're typing args)
+	var inline_prompt := prompt_input as GodetteComposerPromptInput
+	if inline_prompt == null:
+		composer_slash_popup.close_popup()
+		return
+	var pt: String = inline_prompt.get_plain_text()
+	if not pt.begins_with("/"):
+		composer_slash_popup.close_popup()
+		return
+	if not inline_prompt.get_chip_keys_in_order().is_empty():
+		composer_slash_popup.close_popup()
+		return
+	# Allow the popup to stay open after the user types `<command> `
+	# but close once they continue with another whitespace block —
+	# that's the threshold where they're really past the command name.
+	var first_space: int = pt.find(" ")
+	var partial: String = pt.substr(1) if first_space < 0 else pt.substr(1, first_space - 1)
+	# Refresh popup's command list each time — `available_commands`
+	# updates arrive asynchronously and the popup's own cache should
+	# follow whatever the active session reports right now.
+	var session: Dictionary = _state.sessions[current_session_index]
+	var available_commands_dict_variant = session.get("available_commands", {})
+	var raw_cmds: Array = []
+	if typeof(available_commands_dict_variant) == TYPE_DICTIONARY:
+		var available_commands_dict: Dictionary = available_commands_dict_variant
+		raw_cmds = available_commands_dict.get("availableCommands", [])
+	composer_slash_popup.set_commands(raw_cmds)
+	if raw_cmds.is_empty():
+		composer_slash_popup.close_popup()
+		return
+	# Anchor on the composer's outer styled frame (the PanelContainer
+	# parent) rather than `prompt_input` itself — `prompt_input` sits
+	# inside the frame's padding, and using its rect lets the popup's
+	# bottom edge sit a few pixels INTO the visible composer border.
+	# The frame's global_rect matches what the user sees as "the input
+	# box top".
+	var anchor_node: Control = prompt_input
+	var parent: Node = prompt_input.get_parent()
+	if parent is Control:
+		anchor_node = parent as Control
+	var anchor_pos: Vector2 = anchor_node.get_screen_position()
+	var anchor_size: Vector2 = anchor_node.size
+	composer_slash_popup.show_filtered(partial, anchor_pos, anchor_size)
+
+
+# Insertion contract: replace whatever's in the prompt with `/name ` so
+# the user can either submit (no args) or keep typing args.
+func _on_slash_command_chosen(name: String, _hint: String) -> void:
+	if prompt_input == null:
+		return
+	var inline_prompt := prompt_input as GodetteComposerPromptInput
+	var replacement: String = "/" + name + " "
+	if inline_prompt != null:
+		inline_prompt.text = replacement
+		inline_prompt.set_caret_column(replacement.length())
+		inline_prompt.grab_focus()
+	else:
+		prompt_input.text = replacement
+		prompt_input.set_caret_column(replacement.length())
+		prompt_input.grab_focus()
+
+
+# Top-level key handler — only fires while the slash popup is up and
+# the composer holds focus. We hook this here (rather than letting the
+# popup take focus) so the composer keeps its caret + selection state
+# while the user navigates the list with Up / Down / Enter / Esc.
+func _input(event: InputEvent) -> void:
+	if composer_slash_popup == null or not composer_slash_popup.visible:
+		return
+	if not (event is InputEventKey):
+		return
+	if prompt_input == null or not prompt_input.has_focus():
+		return
+	if composer_slash_popup.handle_key(event):
+		get_viewport().set_input_as_handled()
 
 
 func _on_attachment_activated(key: String) -> void:
