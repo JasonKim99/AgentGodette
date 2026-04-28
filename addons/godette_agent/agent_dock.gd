@@ -123,23 +123,10 @@ var status_label: Label
 var status_dot: PanelContainer
 var loading_scanner: GodetteLoadingScanner
 
-var pending_permissions: Dictionary = {}
-
-# View-local expand state keyed by "agent_id|remote_session_id|tool_call_id".
-var expanded_tool_calls: Dictionary = {}
-# Thinking block expand state keyed by "agent_id|remote_session_id|transcript_index".
-var expanded_thinking_blocks: Dictionary = {}
-var user_toggled_thinking_blocks: Dictionary = {}
-# Most recent auto-expanded thinking key per session, keyed by "agent_id|remote_session_id".
-var auto_expanded_thinking_block: Dictionary = {}
 # Plan summary collapse state keyed by "agent_id|remote_session_id".
+# Per-surface visual flag — kept on the dock since each view tracks its
+# own drawer toggle independently.
 var plan_expanded_sessions: Dictionary = {}
-# Session scopes whose Plan panel has been explicitly dismissed via the ×
-# button. The dismissal is transient — any subsequent `_upsert_plan_entry`
-# call (i.e. the agent writes the todo list again) clears it so a fresh
-# plan update re-surfaces the panel. Persistence across sessions isn't
-# meaningful either way, so we don't save this to disk.
-var plan_dismissed_sessions: Dictionary = {}
 
 const COPIED_STATE_SECONDS := 2.0
 
@@ -153,8 +140,6 @@ const COPIED_STATE_SECONDS := 2.0
 const STREAMING_TICK_INTERVAL_SEC := 0.016
 const STREAMING_REVEAL_TARGET_SEC := 0.2
 
-# Sessions currently replaying history via session/load; their chat log renders are suppressed.
-var replaying_sessions: Dictionary = {}
 # Coalescing flag for chat log rebuilds within a single frame.
 var chat_log_refresh_pending := false
 # Hover-on-host groups polled per frame to emulate Zed's bounds-based group_hover.
@@ -192,21 +177,17 @@ var _pending_delta_writes: Dictionary = {}  # entry_index -> String
 var _delta_flush_pending: bool = false
 var streaming_tick_accumulator_sec: float = 0.0
 
-var connections := {}
-var connection_status := {}
-var pending_remote_sessions := {}
-var pending_remote_session_loads := {}
-var agent_icon_cache := {}
-
-var sessions: Array = []
 var current_session_index := -1
-var next_session_number := 1
-var selected_agent_id := DEFAULT_AGENT_ID
-var startup_discovery_agents := {}
-var persist_timer: Timer
-var persist_dirty := false
 var managed_attachment_cleanup_pending := false
 var editor_fs_scan_pending := false
+
+# Reference to the single shared GodetteState owned by plugin.gd. Bound
+# via `bind()` immediately after construction. Until the dock-internal
+# refactor migrates each `_state.sessions[i]` / `_state.connections[...]` access onto
+# this state, the dock keeps its own duplicate instance vars so the
+# existing flows continue to work — Phase 1 of the state-extraction
+# refactor (design notes in session_state.gd).
+var _state: GodetteState
 
 
 func configure(p_editor_interface: EditorInterface) -> void:
@@ -216,6 +197,32 @@ func configure(p_editor_interface: EditorInterface) -> void:
 	# not have run yet if `configure` fires earlier than `_ready`.
 	call_deferred("_wire_scene_selection_listener")
 	call_deferred("_refresh_focus_indicator")
+
+
+# Plug a shared GodetteState into the dock. Called by plugin.gd right
+# after `configure()` so the dock can read _state.connections / _state.sessions /
+# permissions from a place both the dock and any future AgentMainScreen
+# reference. Safe to call before _ready; all subscriptions go through
+# call_deferred since UI nodes haven't been built yet.
+#
+# Re-points the dock's instance-level dictionaries / arrays at state's
+# copies so reads + writes from either side touch the same data. GDScript
+# Array / Dictionary are reference types, so this is the moral equivalent
+# of `dock._state.sessions IS state._state.sessions`. Step-2-of-N of the state-extraction
+# refactor — once each call site is migrated to call state methods
+# directly, the dock-side aliases get deleted.
+func bind(p_state: GodetteState) -> void:
+	_state = p_state
+	if _state == null:
+		return
+	# State already restored from disk in plugin._enter_tree, so the
+	# in-memory `_state.sessions` array we just aliased is fully populated.
+	# Pick the dock's initial active session from state's surface claim
+	# (set by restore_from_disk) and route through _switch_session so
+	# the UI rebuilds correctly on first show.
+	var preselected: int = _state.get_current_session_for_surface("dock")
+	if preselected >= 0:
+		call_deferred("_switch_session", preselected)
 
 
 func _wire_scene_selection_listener() -> void:
@@ -262,11 +269,9 @@ func _safe_text(text: String) -> String:
 func _ready() -> void:
 	size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	size_flags_vertical = Control.SIZE_EXPAND_FILL
-	persist_timer = Timer.new()
-	persist_timer.one_shot = true
-	persist_timer.wait_time = SESSION_PERSIST_DEBOUNCE_SEC
-	persist_timer.timeout.connect(Callable(self, "_flush_persist_state"))
-	add_child(persist_timer)
+	# Persistence (timer, dirty flag, debounce) lives on GodetteState.
+	# Dock just calls `_state.schedule_persist()` / `_state._flush_persist_state()`
+	# through the wrappers below.
 	_build_ui()
 	_refresh_add_menu()
 	# Startup reconciles three sources in order:
@@ -299,18 +304,18 @@ func _notification(what: int) -> void:
 
 
 func shutdown() -> void:
-	if persist_timer != null and is_instance_valid(persist_timer):
-		persist_timer.stop()
+	# State's persist timer is a child of the plugin and gets freed
+	# automatically when the plugin disables; no need to stop it here.
 	_flush_persist_state()
 	_cleanup_managed_attachments()
-	for connection in connections.values():
+	for connection in _state.connections.values():
 		if is_instance_valid(connection):
 			connection.shutdown()
 			connection.queue_free()
-	connections.clear()
-	connection_status.clear()
-	pending_remote_sessions.clear()
-	pending_remote_session_loads.clear()
+	_state.connections.clear()
+	_state.connection_status.clear()
+	_state.pending_remote_sessions.clear()
+	_state.pending_remote_session_loads.clear()
 
 
 func _build_ui() -> void:
@@ -709,7 +714,7 @@ func _now_tick() -> int:
 
 
 func _touch_session(session_index: int) -> void:
-	if session_index < 0 or session_index >= sessions.size():
+	if session_index < 0 or session_index >= _state.sessions.size():
 		return
 
 	# We used to synchronously rewrite the full thread cache here on every
@@ -725,55 +730,30 @@ func _touch_session(session_index: int) -> void:
 	_schedule_persist_state()
 
 
-func _any_session_streaming() -> bool:
-	# True while any ACP turn is mid-flight. Used to gate the persist
-	# debounce off during streaming — writing 19 sessions' worth of
-	# JSON + disk flush costs 20-60 ms each tick and stacks into
-	# visible stutter.
-	for session_variant in sessions:
-		if typeof(session_variant) != TYPE_DICTIONARY:
-			continue
-		if bool((session_variant as Dictionary).get("busy", false)):
-			return true
-	return false
-
-
 # Thin wrapper around GodetteSessionStore.persist that pins the dock's
-# current state into the static call. Persist logic + I/O lives in the
-# store; the dock owns only the Timer debounce plumbing below.
+# current state into the static call. Persistence logic + I/O lives on
+# state + the store; the dock just nudges state's "active session"
+# claim before triggering a flush.
 func _persist_state() -> void:
-	SessionStoreScript.persist(
-		sessions,
-		current_session_index,
-		next_session_number,
-		selected_agent_id,
-		DEFAULT_AGENT_ID,
-	)
+	if _state == null:
+		return
+	_state.set_current_session_for_surface("dock", current_session_index)
+	_state._persist_dirty = true
+	_state._flush_persist_state()
 
 
 func _schedule_persist_state() -> void:
-	persist_dirty = true
-	# Skip while any session is actively streaming. Writing the full
-	# transcript + metadata index on every tool_call / chunk / plan
-	# update blocks the main thread long enough to cause the "smooth
-	# → stall → smooth" pattern users see during long agent turns.
-	# Turn endings (`_on_connection_prompt_finished` /
-	# `_on_connection_prompt_error`) explicitly flush, so we never
-	# lose a completed turn's state — only the partial mid-stream
-	# state that's already in memory.
-	if _any_session_streaming():
+	if _state == null:
 		return
-	if persist_timer == null or not is_instance_valid(persist_timer):
-		_flush_persist_state()
-		return
-	persist_timer.start()
+	_state.set_current_session_for_surface("dock", current_session_index)
+	_state.schedule_persist()
 
 
 func _flush_persist_state() -> void:
-	if not persist_dirty:
+	if _state == null:
 		return
-	persist_dirty = false
-	_persist_state()
+	_state.set_current_session_for_surface("dock", current_session_index)
+	_state._flush_persist_state()
 
 
 func _managed_attachment_dir_path() -> String:
@@ -859,7 +839,7 @@ func _mark_managed_attachment_refs(refs_variant: Variant, referenced: Dictionary
 
 func _collect_referenced_managed_attachment_paths() -> Dictionary:
 	var referenced: Dictionary = {}
-	for session_variant in sessions:
+	for session_variant in _state.sessions:
 		if typeof(session_variant) != TYPE_DICTIONARY:
 			continue
 		var session: Dictionary = session_variant
@@ -927,7 +907,7 @@ func _timestamp_msec_from_iso(value: String) -> int:
 
 
 func _most_recent_session_index() -> int:
-	if sessions.is_empty():
+	if _state.sessions.is_empty():
 		return -1
 
 	# Sort by the same timestamp the menu shows — filesystem mtime of
@@ -935,9 +915,9 @@ func _most_recent_session_index() -> int:
 	# "most recent" notion here can diverge from what's visibly at the
 	# top of the thread menu.
 	var best_index := 0
-	var best_ts: int = _session_activity_msec(sessions[0])
-	for session_index in range(1, sessions.size()):
-		var candidate_ts: int = _session_activity_msec(sessions[session_index])
+	var best_ts: int = _session_activity_msec(_state.sessions[0])
+	for session_index in range(1, _state.sessions.size()):
+		var candidate_ts: int = _session_activity_msec(_state.sessions[session_index])
 		if candidate_ts > best_ts:
 			best_index = session_index
 			best_ts = candidate_ts
@@ -945,24 +925,29 @@ func _most_recent_session_index() -> int:
 
 
 func _restore_persisted_state() -> bool:
-	# Parse + legacy migration + metadata-only hydration all live on
-	# SessionStore.load_persisted. The dock picks an active session
-	# afterward: explicit "was current when Godot closed" beats
-	# most-recent-updated so replay-driven `_touch_session` bumps on
-	# background threads don't silently steal the active slot from the
-	# one the user was actually reading.
+	# When a state is bound, plugin.gd already called `state.restore_from_disk`
+	# during `_enter_tree`, and `bind()` queued `_switch_session` to the
+	# right initial session. Skip the duplicate load here so we don't
+	# stomp the state-driven session pick.
+	if _state != null:
+		if not _state.sessions.is_empty():
+			_purge_legacy_cancellation_system_messages()
+			_backfill_derived_titles()
+		return not _state.sessions.is_empty()
+	# Pre-bind fallback — preserved verbatim. Used only if dock runs
+	# without the state plug (e.g. legacy embedding).
 	var result: Dictionary = SessionStoreScript.load_persisted(DEFAULT_AGENT_ID)
 	if not bool(result.get("found", false)):
 		return false
 
-	var loaded_sessions_variant = result.get("sessions", [])
+	var loaded_sessions_variant = result.get("_state.sessions", [])
 	var loaded_sessions: Array = loaded_sessions_variant if loaded_sessions_variant is Array else []
 	if loaded_sessions.is_empty():
 		return false
 
-	sessions = loaded_sessions
-	next_session_number = int(result.get("next_session_number", sessions.size() + 1))
-	selected_agent_id = str(result.get("selected_agent_id", DEFAULT_AGENT_ID))
+	_state.sessions = loaded_sessions
+	_state.next_session_number = int(result.get("_state.next_session_number", _state.sessions.size() + 1))
+	_state.selected_agent_id = str(result.get("_state.selected_agent_id", DEFAULT_AGENT_ID))
 
 	# One-shot migrations. Each one reads / patches the per-session
 	# thread cache files on disk; runs only when there's work to do so
@@ -990,8 +975,8 @@ func _purge_legacy_cancellation_system_messages() -> void:
 	# Scrub any lingering copies from both the in-memory transcript of
 	# the current hydrated session AND the on-disk cache files for the
 	# rest.
-	for session_index in range(sessions.size()):
-		var session: Dictionary = sessions[session_index]
+	for session_index in range(_state.sessions.size()):
+		var session: Dictionary = _state.sessions[session_index]
 		var session_id := str(session.get("id", ""))
 		if session_id.is_empty():
 			continue
@@ -1001,7 +986,7 @@ func _purge_legacy_cancellation_system_messages() -> void:
 				var cleaned_memory := _strip_legacy_cancel_messages(in_memory_variant)
 				if cleaned_memory.size() != (in_memory_variant as Array).size():
 					session["transcript"] = cleaned_memory
-					sessions[session_index] = session
+					_state.sessions[session_index] = session
 			continue
 		var cache: Dictionary = SessionStoreScript.read_thread_cache(session_id)
 		if cache.is_empty():
@@ -1036,8 +1021,8 @@ func _strip_legacy_cancel_messages(transcript: Array) -> Array:
 
 func _backfill_derived_titles() -> void:
 	var changed := false
-	for session_index in range(sessions.size()):
-		var session: Dictionary = sessions[session_index]
+	for session_index in range(_state.sessions.size()):
+		var session: Dictionary = _state.sessions[session_index]
 		if not str(session.get("derived_title", "")).strip_edges().is_empty():
 			continue
 		# Only peek when the session actually needs the backfill —
@@ -1062,7 +1047,7 @@ func _backfill_derived_titles() -> void:
 			if snippet.is_empty():
 				continue
 			session["derived_title"] = snippet
-			sessions[session_index] = session
+			_state.sessions[session_index] = session
 			changed = true
 			break
 	if changed:
@@ -1070,46 +1055,46 @@ func _backfill_derived_titles() -> void:
 
 
 func _begin_session_discovery() -> void:
-	startup_discovery_agents.clear()
+	_state.startup_discovery_agents.clear()
 	for agent in AGENTS:
 		var agent_id: String = str(agent.get("id", ""))
 		if agent_id.is_empty():
 			continue
-		startup_discovery_agents[agent_id] = true
+		_state.startup_discovery_agents[agent_id] = true
 		_ensure_connection(agent_id)
 
 
 func _finish_startup_discovery_for_agent(agent_id: String) -> void:
-	if not startup_discovery_agents.has(agent_id):
+	if not _state.startup_discovery_agents.has(agent_id):
 		return
 
-	startup_discovery_agents.erase(agent_id)
-	if not startup_discovery_agents.is_empty():
+	_state.startup_discovery_agents.erase(agent_id)
+	if not _state.startup_discovery_agents.is_empty():
 		return
 
-	if sessions.is_empty():
+	if _state.sessions.is_empty():
 		_create_session(DEFAULT_AGENT_ID, true, true)
 	elif current_session_index < 0:
 		_switch_session(0)
 
 
 func _current_thread_title() -> String:
-	if current_session_index < 0 or current_session_index >= sessions.size():
+	if current_session_index < 0 or current_session_index >= _state.sessions.size():
 		return "New Thread"
 	# Use the same derived-from-first-user-message fallback as the
 	# thread menu so the header and the menu don't disagree on what
 	# a session is called.
-	return _safe_text(_session_display_title(sessions[current_session_index]))
+	return _safe_text(_session_display_title(_state.sessions[current_session_index]))
 
 
 func _recent_session_indices(limit: int) -> Array:
 	var ordered: Array = []
-	for session_index in range(sessions.size()):
+	for session_index in range(_state.sessions.size()):
 		var inserted := false
-		var updated_at: int = _session_activity_msec(sessions[session_index])
+		var updated_at: int = _session_activity_msec(_state.sessions[session_index])
 		for ordered_index in range(ordered.size()):
 			var candidate_index: int = int(ordered[ordered_index])
-			var candidate_updated_at: int = _session_activity_msec(sessions[candidate_index])
+			var candidate_updated_at: int = _session_activity_msec(_state.sessions[candidate_index])
 			if updated_at > candidate_updated_at:
 				ordered.insert(ordered_index, session_index)
 				inserted = true
@@ -1127,10 +1112,10 @@ func _recent_session_indices(limit: int) -> Array:
 
 
 func _thread_menu_label(session_index: int) -> String:
-	if session_index < 0 or session_index >= sessions.size():
+	if session_index < 0 or session_index >= _state.sessions.size():
 		return "Session"
 
-	var session: Dictionary = sessions[session_index]
+	var session: Dictionary = _state.sessions[session_index]
 	var title := _session_display_title(session)
 	# `updated_at` source of truth = thread cache file's mtime. The
 	# file is rewritten on every _touch_session, so its mtime tracks
@@ -1144,7 +1129,7 @@ func _thread_menu_label(session_index: int) -> String:
 
 func _session_display_title(session: Dictionary) -> String:
 	# Prefer a title the adapter (or remote session info) set explicitly.
-	# For locally-created sessions whose adapter never emitted a
+	# For locally-created _state.sessions whose adapter never emitted a
 	# session_info_update, the stored title is a placeholder like
 	# "Session 14" — substitute the first user message's content so the
 	# menu shows what the conversation is actually about. `derived_title`
@@ -1222,10 +1207,10 @@ func _session_activity_msec(session: Dictionary) -> int:
 
 
 func _thread_menu_tooltip(session_index: int) -> String:
-	if session_index < 0 or session_index >= sessions.size():
+	if session_index < 0 or session_index >= _state.sessions.size():
 		return "Session"
 
-	var session: Dictionary = sessions[session_index]
+	var session: Dictionary = _state.sessions[session_index]
 	return _safe_text("%s | %s" % [str(session.get("title", "Session")), _agent_label(str(session.get("agent_id", DEFAULT_AGENT_ID)))])
 
 
@@ -1260,8 +1245,8 @@ func _relative_time_label(updated_at_msec: int) -> String:
 
 func _agent_icon_texture(agent_id: String, size: int = HEADER_AGENT_ICON_SIZE) -> Texture2D:
 	var cache_key := "%s:%d" % [agent_id, size]
-	if agent_icon_cache.has(cache_key):
-		return agent_icon_cache[cache_key]
+	if _state.agent_icon_cache.has(cache_key):
+		return _state.agent_icon_cache[cache_key]
 
 	var source_texture: Texture2D = CLAUDE_AGENT_ICON
 	match agent_id:
@@ -1274,7 +1259,7 @@ func _agent_icon_texture(agent_id: String, size: int = HEADER_AGENT_ICON_SIZE) -
 		image.resize(size, size, Image.INTERPOLATE_LANCZOS)
 		scaled_texture = ImageTexture.create_from_image(image)
 
-	agent_icon_cache[cache_key] = scaled_texture
+	_state.agent_icon_cache[cache_key] = scaled_texture
 	return scaled_texture
 
 
@@ -1371,7 +1356,7 @@ func _build_tool_call_entry(entry: Dictionary) -> Control:
 	# a chat full of `Read X.rs` calls doesn't explode into a wall of
 	# disclosure cards.
 	var pending_request_id: int = int(entry.get("pending_permission_request_id", -1))
-	var awaiting_permission: bool = pending_request_id >= 0 and pending_permissions.has(pending_request_id)
+	var awaiting_permission: bool = pending_request_id >= 0 and _state.pending_permissions.has(pending_request_id)
 	var style: String = _tool_call_style(entry, awaiting_permission)
 	if style == "inline":
 		return _build_tool_call_inline(entry)
@@ -1488,7 +1473,7 @@ func _build_tool_call_inline(entry: Dictionary) -> Control:
 	# COLLAPSED state, header gets a hover-revealed chevron to open the
 	# panel in the first place.
 	var expand_key: String = _tool_call_expand_key(entry)
-	var user_expanded: bool = not expand_key.is_empty() and expanded_tool_calls.has(expand_key)
+	var user_expanded: bool = not expand_key.is_empty() and _state.expanded_tool_calls.has(expand_key)
 	var raw_input_text: String = _safe_text(str(entry.get("raw_input", "")))
 	var summary_text: String = _safe_text(str(entry.get("summary", "")))
 	var has_raw_input: bool = not raw_input_text.is_empty()
@@ -1521,7 +1506,7 @@ func _build_tool_call_inline(entry: Dictionary) -> Control:
 		if has_output:
 			body_col.add_child(_make_tool_section_label(GodetteI18n.t("Output:"), muted_color))
 			var output_key: String = expand_key + "|full" if not expand_key.is_empty() else ""
-			var show_full: bool = not output_key.is_empty() and expanded_tool_calls.has(output_key)
+			var show_full: bool = not output_key.is_empty() and _state.expanded_tool_calls.has(output_key)
 			var is_long: bool = _is_long_tool_content(summary_text)
 			var display_text: String = summary_text
 			if is_long and not show_full:
@@ -1638,7 +1623,7 @@ func _build_tool_call_card(entry: Dictionary, awaiting_permission: bool) -> Cont
 	var pending_request_id: int = int(entry.get("pending_permission_request_id", -1))
 
 	var expand_key: String = _tool_call_expand_key(entry)
-	var user_expanded: bool = not expand_key.is_empty() and expanded_tool_calls.has(expand_key)
+	var user_expanded: bool = not expand_key.is_empty() and _state.expanded_tool_calls.has(expand_key)
 	var summary_text: String = _safe_text(str(entry.get("summary", "")))
 	var body_text: String = _safe_text(str(entry.get("content", "")))
 	var has_expandable_body: bool = not summary_text.is_empty() or not body_text.is_empty()
@@ -1714,7 +1699,7 @@ func _build_tool_call_card(entry: Dictionary, awaiting_permission: bool) -> Cont
 	# main reason the confirmation dialog exploded into an 80-line wall.
 	if is_open and not summary_text.is_empty():
 		var full_key: String = expand_key + "|full" if not expand_key.is_empty() else ""
-		var show_full: bool = not full_key.is_empty() and expanded_tool_calls.has(full_key)
+		var show_full: bool = not full_key.is_empty() and _state.expanded_tool_calls.has(full_key)
 		var is_long: bool = _is_long_tool_content(summary_text)
 
 		var display_text: String = summary_text
@@ -1772,10 +1757,10 @@ func _make_show_more_toggle(is_expanded: bool, expand_key: String) -> Control:
 func _on_tool_call_show_more_pressed(full_key: String) -> void:
 	if full_key.is_empty():
 		return
-	if expanded_tool_calls.has(full_key):
-		expanded_tool_calls.erase(full_key)
+	if _state.expanded_tool_calls.has(full_key):
+		_state.expanded_tool_calls.erase(full_key)
 	else:
-		expanded_tool_calls[full_key] = true
+		_state.expanded_tool_calls[full_key] = true
 	# Peel "|full" off the right; the remainder is the base expand_key whose
 	# tool_call_id is already its last segment.
 	var without_suffix: PackedStringArray = full_key.rsplit("|", false, 1)
@@ -1788,7 +1773,7 @@ func _on_tool_call_show_more_pressed(full_key: String) -> void:
 		_refresh_chat_log()
 		return
 	var tool_call_id: String = base_parts[1]
-	var session: Dictionary = sessions[current_session_index]
+	var session: Dictionary = _state.sessions[current_session_index]
 	var tool_calls: Dictionary = session.get("tool_calls", {})
 	var tool_state: Dictionary = tool_calls.get(tool_call_id, {})
 	var transcript_index: int = int(tool_state.get("transcript_index", -1))
@@ -1800,9 +1785,9 @@ func _on_tool_call_show_more_pressed(full_key: String) -> void:
 
 func _tool_call_expand_key(entry: Dictionary) -> String:
 	var tool_call_id: String = str(entry.get("tool_call_id", ""))
-	if tool_call_id.is_empty() or current_session_index < 0 or current_session_index >= sessions.size():
+	if tool_call_id.is_empty() or current_session_index < 0 or current_session_index >= _state.sessions.size():
 		return ""
-	var session: Dictionary = sessions[current_session_index]
+	var session: Dictionary = _state.sessions[current_session_index]
 	return "%s|%s|%s" % [
 		str(session.get("agent_id", DEFAULT_AGENT_ID)),
 		str(session.get("remote_session_id", "")),
@@ -1813,10 +1798,10 @@ func _tool_call_expand_key(entry: Dictionary) -> String:
 func _on_tool_call_disclosure_pressed(expand_key: String) -> void:
 	if expand_key.is_empty():
 		return
-	if expanded_tool_calls.has(expand_key):
-		expanded_tool_calls.erase(expand_key)
+	if _state.expanded_tool_calls.has(expand_key):
+		_state.expanded_tool_calls.erase(expand_key)
 	else:
-		expanded_tool_calls[expand_key] = true
+		_state.expanded_tool_calls[expand_key] = true
 
 	# Translate the expand_key back to a transcript index so we can patch just
 	# that entry instead of rebuilding the whole feed.
@@ -1825,7 +1810,7 @@ func _on_tool_call_disclosure_pressed(expand_key: String) -> void:
 		_refresh_chat_log()
 		return
 	var tool_call_id := str(parts[parts.size() - 1])
-	var session: Dictionary = sessions[current_session_index]
+	var session: Dictionary = _state.sessions[current_session_index]
 	var tool_calls: Dictionary = session.get("tool_calls", {})
 	var tool_state: Dictionary = tool_calls.get(tool_call_id, {})
 	var transcript_index: int = int(tool_state.get("transcript_index", -1))
@@ -2035,9 +2020,9 @@ func _queue_streaming_delta(session: Dictionary, entry_index: int, delta: String
 func _flush_streaming_pending_for_session(session_index: int) -> void:
 	# Called on prompt_finished to release any un-revealed bytes immediately so
 	# the user sees the final state without the 200ms tail.
-	if session_index < 0 or session_index >= sessions.size():
+	if session_index < 0 or session_index >= _state.sessions.size():
 		return
-	var session: Dictionary = sessions[session_index]
+	var session: Dictionary = _state.sessions[session_index]
 	var scope := "%s|%s" % [
 		str(session.get("agent_id", DEFAULT_AGENT_ID)),
 		str(session.get("remote_session_id", "")),
@@ -2084,7 +2069,7 @@ func _build_permission_option_row(request_id: int) -> Control:
 	col.add_child(separator)
 	wrapper.add_child(col)
 
-	var pending: Dictionary = pending_permissions.get(request_id, {})
+	var pending: Dictionary = _state.pending_permissions.get(request_id, {})
 	var options: Array = pending.get("options", [])
 	var success_color: Color = EditorTheme.color("success_color", "Editor", Color(0.48, 0.80, 0.54))
 	var error_color: Color = EditorTheme.color("error_color", "Editor", Color(0.93, 0.50, 0.50))
@@ -2188,7 +2173,7 @@ func _build_thinking_entry(entry: Dictionary, entry_index: int = -1) -> Control:
 	if not session_scope.is_empty() and entry_index >= 0:
 		block_key = "%s|%d" % [session_scope, entry_index]
 
-	var is_open: bool = not block_key.is_empty() and expanded_thinking_blocks.has(block_key)
+	var is_open: bool = not block_key.is_empty() and _state.expanded_thinking_blocks.has(block_key)
 
 	# Zed thinking block spec: lives at the assistant indentation (px_5)
 	# with light internal padding; no card background in Auto display mode.
@@ -2248,11 +2233,11 @@ func _build_thinking_entry(entry: Dictionary, entry_index: int = -1) -> Control:
 func _on_thinking_block_pressed(block_key: String) -> void:
 	if block_key.is_empty():
 		return
-	if expanded_thinking_blocks.has(block_key):
-		expanded_thinking_blocks.erase(block_key)
+	if _state.expanded_thinking_blocks.has(block_key):
+		_state.expanded_thinking_blocks.erase(block_key)
 	else:
-		expanded_thinking_blocks[block_key] = true
-	user_toggled_thinking_blocks[block_key] = true
+		_state.expanded_thinking_blocks[block_key] = true
+	_state.user_toggled_thinking_blocks[block_key] = true
 
 	var parts := block_key.rsplit("|", false, 1)
 	if parts.size() == 2 and parts[1].is_valid_int():
@@ -2400,7 +2385,7 @@ func _build_user_bubble_flow(segments: Array) -> Control:
 
 	# Meta click handler needs the segment list so it can resolve the
 	# clicked index back to an open-target dispatch. Binding it per-bubble
-	# avoids a field-level cache that would drift across sessions.
+	# avoids a field-level cache that would drift across _state.sessions.
 	rtl.meta_clicked.connect(Callable(self, "_on_user_bubble_meta_clicked").bind(segments))
 
 	var chip_bg := _user_bubble_chip_bg_color()
@@ -2571,12 +2556,12 @@ func _on_user_block_right_clicked(_local_pos: Vector2, source: GodetteTextBlock)
 func _is_assistant_entry_streaming(entry_index: int) -> bool:
 	# True if any session is currently streaming into this entry slot. The
 	# build seam uses this to choose between the single-TextBlock streaming
-	# layout and the markdown blocks layout. We scan all sessions, not just
-	# the active one, because background sessions can also be streaming
+	# layout and the markdown blocks layout. We scan all _state.sessions, not just
+	# the active one, because background _state.sessions can also be streaming
 	# simultaneously and only the build site here knows the entry_index.
 	if entry_index < 0:
 		return false
-	for session_variant in sessions:
+	for session_variant in _state.sessions:
 		var session: Dictionary = session_variant
 		if not bool(session.get("busy", false)):
 			continue
@@ -2917,16 +2902,16 @@ func _refresh_plan_drawer() -> void:
 	for child in plan_drawer_content.get_children():
 		child.queue_free()
 
-	if current_session_index < 0 or current_session_index >= sessions.size():
+	if current_session_index < 0 or current_session_index >= _state.sessions.size():
 		plan_drawer.visible = false
 		return
 
-	var session: Dictionary = sessions[current_session_index]
+	var session: Dictionary = _state.sessions[current_session_index]
 	var plan_entries_variant = session.get("plan_entries", [])
 	var plan_entries: Array = plan_entries_variant if plan_entries_variant is Array else []
 	var session_key: String = _current_session_scope_key()
 
-	if plan_entries.is_empty() or bool(plan_dismissed_sessions.get(session_key, false)):
+	if plan_entries.is_empty() or bool(_state.plan_dismissed_sessions.get(session_key, false)):
 		plan_drawer.visible = false
 		return
 
@@ -3019,11 +3004,11 @@ func _refresh_queue_drawer() -> void:
 	for child in queue_drawer_content.get_children():
 		child.queue_free()
 
-	if current_session_index < 0 or current_session_index >= sessions.size():
+	if current_session_index < 0 or current_session_index >= _state.sessions.size():
 		queue_drawer.visible = false
 		return
 
-	var session: Dictionary = sessions[current_session_index]
+	var session: Dictionary = _state.sessions[current_session_index]
 	var queue_variant = session.get("queued_prompts", [])
 	var queue: Array = queue_variant if queue_variant is Array else []
 	if queue.is_empty():
@@ -3287,28 +3272,18 @@ func _on_queue_summary_pressed(session_key: String) -> void:
 
 
 func _on_queue_clear_all_pressed() -> void:
-	if current_session_index < 0 or current_session_index >= sessions.size():
+	if current_session_index < 0 or current_session_index >= _state.sessions.size():
 		return
-	var session: Dictionary = sessions[current_session_index]
-	session["queued_prompts"] = []
-	sessions[current_session_index] = session
+	_state.clear_queue(current_session_index)
 	_refresh_queue_drawer()
 	_refresh_queue_indicator()
 
 
 func _on_queue_delete_pressed(index: int) -> void:
-	if current_session_index < 0 or current_session_index >= sessions.size():
+	if current_session_index < 0 or current_session_index >= _state.sessions.size():
 		return
-	var session: Dictionary = sessions[current_session_index]
-	var queue_variant = session.get("queued_prompts", [])
-	if not (queue_variant is Array):
+	if _state.remove_queue_entry(current_session_index, index) == null:
 		return
-	var queue: Array = queue_variant
-	if index < 0 or index >= queue.size():
-		return
-	queue.remove_at(index)
-	session["queued_prompts"] = queue
-	sessions[current_session_index] = session
 	_refresh_queue_drawer()
 	_refresh_queue_indicator()
 
@@ -3320,24 +3295,17 @@ func _on_queue_send_now_pressed(index: int) -> void:
 	# dispatches. `_cancel_current_turn` triggers prompt_finished,
 	# which in turn calls `_dispatch_next_prompt` — so we don't have
 	# to re-dispatch here when busy.
-	if current_session_index < 0 or current_session_index >= sessions.size():
+	if current_session_index < 0 or current_session_index >= _state.sessions.size():
 		return
-	var session: Dictionary = sessions[current_session_index]
-	var queue_variant = session.get("queued_prompts", [])
-	if not (queue_variant is Array):
-		return
-	var queue: Array = queue_variant
+	var session: Dictionary = _state.sessions[current_session_index]
+	var queue: Array = session.get("queued_prompts", [])
 	if index < 0 or index >= queue.size():
 		return
 	# Move the target to the head of the queue if it wasn't already.
-	# Re-persist so the reorder survives an editor crash before the
-	# message fires.
+	# Re-persist (via state) so the reorder survives an editor crash
+	# before the message fires.
 	if index > 0:
-		var entry = queue[index]
-		queue.remove_at(index)
-		queue.insert(0, entry)
-		session["queued_prompts"] = queue
-		sessions[current_session_index] = session
+		_state.move_queue_entry(current_session_index, index, 0)
 	_refresh_queue_drawer()
 	_refresh_queue_indicator()
 	if bool(session.get("busy", false)):
@@ -3355,29 +3323,19 @@ func _on_queue_edit_pressed(index: int) -> void:
 	# the user was currently typing gets dropped — same Zed behaviour
 	# (edit pulls the queued message INTO the main editor, replacing
 	# whatever was there).
-	if current_session_index < 0 or current_session_index >= sessions.size():
+	if current_session_index < 0 or current_session_index >= _state.sessions.size():
 		return
-	var session: Dictionary = sessions[current_session_index]
-	var queue_variant = session.get("queued_prompts", [])
-	if not (queue_variant is Array):
-		return
-	var queue: Array = queue_variant
-	if index < 0 or index >= queue.size():
-		return
-	var entry_variant = queue[index]
+	var entry_variant = _state.remove_queue_entry(current_session_index, index)
 	if typeof(entry_variant) != TYPE_DICTIONARY:
 		return
 	var entry: Dictionary = entry_variant
-	queue.remove_at(index)
-	session["queued_prompts"] = queue
 	# Restore attachments to session.attachments (for the chip overlay +
 	# the next _send_prompt) before poking the composer, so the
 	# composer's chip layer has the metadata it needs to reconstruct
 	# chips on restore.
 	var restored_attachments_variant = entry.get("attachments", [])
 	var restored_attachments: Array = restored_attachments_variant.duplicate(true) if restored_attachments_variant is Array else []
-	session["attachments"] = restored_attachments
-	sessions[current_session_index] = session
+	_state.set_session_attachments(current_session_index, restored_attachments)
 	# Composer text + chips: build a draft dict shaped like
 	# GodetteComposerPromptInput.serialize_draft's output so we can
 	# reuse its restore_draft path unchanged.
@@ -3476,11 +3434,11 @@ func _on_plan_close_pressed(_session_key: String) -> void:
 	# Clearing matches the user's intent — "this plan is done, get it
 	# out of here" — and the next _upsert_plan_entry (agent writes a
 	# fresh TodoWrite) surfaces the drawer again with new content.
-	if current_session_index < 0 or current_session_index >= sessions.size():
+	if current_session_index < 0 or current_session_index >= _state.sessions.size():
 		return
-	var session: Dictionary = sessions[current_session_index]
+	var session: Dictionary = _state.sessions[current_session_index]
 	session["plan_entries"] = []
-	sessions[current_session_index] = session
+	_state.sessions[current_session_index] = session
 	_touch_session(current_session_index)
 	_refresh_plan_drawer()
 
@@ -3501,9 +3459,9 @@ func _make_plan_close_button() -> Button:
 
 
 func _current_session_scope_key() -> String:
-	if current_session_index < 0 or current_session_index >= sessions.size():
+	if current_session_index < 0 or current_session_index >= _state.sessions.size():
 		return ""
-	var session: Dictionary = sessions[current_session_index]
+	var session: Dictionary = _state.sessions[current_session_index]
 	return "%s|%s" % [
 		str(session.get("agent_id", DEFAULT_AGENT_ID)),
 		str(session.get("remote_session_id", "")),
@@ -3785,7 +3743,7 @@ func _send_prompt() -> void:
 		_append_system_message(GodetteI18n.t("Write a prompt first."))
 		return
 
-	var session: Dictionary = sessions[current_session_index]
+	var session: Dictionary = _state.sessions[current_session_index]
 	# Busy → enqueue and let `_on_connection_prompt_finished` pick it up
 	# when the current turn ends. `_dispatch_next_prompt` already no-ops
 	# while busy, so calling it unconditionally is safe.
@@ -3797,25 +3755,25 @@ func _send_prompt() -> void:
 	var focus_block: Dictionary = _build_focus_context_block()
 	if not focus_block.is_empty():
 		blocks.append(focus_block)
-	var queue: Array = session.get("queued_prompts", [])
 	# Carry enough on the queue entry to support Zed's three per-row
 	# actions (edit / send-now / delete):
 	#   blocks       → what the ACP adapter sees on send
 	#   display_text → single-line preview for the drawer
 	#   segments     → composer text + inline-chip restore on edit
 	#   attachments  → session.attachments restore on edit
-	queue.append({
+	_state.append_queue_entry(current_session_index, {
 		"blocks": blocks,
 		"display_text": prompt,
 		"segments": prompt_segments.duplicate(true),
 		"attachments": attachments.duplicate(true),
 	})
-	session["queued_prompts"] = queue
+	# managed_attachment_refs is data the persistence layer reads back on
+	# next launch — write directly until that dict gets its own setter.
 	session["managed_attachment_refs"] = _merge_managed_attachment_refs(
 		session.get("managed_attachment_refs", []),
 		attachments
 	)
-	sessions[current_session_index] = session
+	_state.sessions[current_session_index] = session
 
 	# Composer is cleared on enqueue so the user can keep typing the
 	# NEXT prompt immediately. The transcript's user-bubble, however,
@@ -3843,10 +3801,10 @@ func _send_prompt() -> void:
 
 
 func _on_send_button_pressed() -> void:
-	if current_session_index < 0 or current_session_index >= sessions.size():
+	if current_session_index < 0 or current_session_index >= _state.sessions.size():
 		return
 
-	var session: Dictionary = sessions[current_session_index]
+	var session: Dictionary = _state.sessions[current_session_index]
 	# Three-way dispatch matching _refresh_send_state's icon choice:
 	#   idle          → send
 	#   busy + empty  → cancel the current turn
@@ -3869,10 +3827,10 @@ func _on_composer_submit_requested() -> void:
 
 
 func _dispatch_next_prompt(session_index: int) -> void:
-	if session_index < 0 or session_index >= sessions.size():
+	if session_index < 0 or session_index >= _state.sessions.size():
 		return
 
-	var session: Dictionary = sessions[session_index]
+	var session: Dictionary = _state.sessions[session_index]
 	if bool(session.get("busy", false)):
 		return
 
@@ -3888,12 +3846,18 @@ func _dispatch_next_prompt(session_index: int) -> void:
 	if connection == null:
 		return
 
-	var next_prompt: Dictionary = queue.pop_front()
-	session["queued_prompts"] = queue
-	session["busy"] = true
+	var next_prompt_variant = _state.pop_queue_front(session_index)
+	if typeof(next_prompt_variant) != TYPE_DICTIONARY:
+		return
+	var next_prompt: Dictionary = next_prompt_variant
 	session["cancelling"] = false
 	session["assistant_entry_index"] = -1
-	sessions[session_index] = session
+	_state.sessions[session_index] = session
+	# `busy=true` writes through state so views (composer send button,
+	# status indicator) get the `session_busy_changed` signal — see
+	# session_state.gd. Other fields stay as direct dict writes for now;
+	# they'll migrate when their consumers move off direct reads.
+	_state.set_session_busy(session_index, true)
 
 	# Append the user-bubble to the transcript RIGHT before dispatching.
 	# Done here — not in `_send_prompt` — so that prompts queued while
@@ -3909,10 +3873,10 @@ func _dispatch_next_prompt(session_index: int) -> void:
 
 	var request_id: int = int(connection.prompt(remote_session_id, next_prompt.get("blocks", [])))
 	if request_id < 0:
-		queue.push_front(next_prompt)
-		session["queued_prompts"] = queue
-		session["busy"] = false
-		sessions[session_index] = session
+		# Dispatch failed — put the prompt back on the front of the queue
+		# so the next dispatch attempt picks it up first.
+		_state.push_queue_front(session_index, next_prompt)
+		_state.set_session_busy(session_index, false)
 		_append_transcript_to_session(session_index, "System", GodetteI18n.t("Couldn't send the prompt to the local ACP adapter."))
 		_refresh_send_state()
 		_refresh_status()
@@ -3925,10 +3889,10 @@ func _dispatch_next_prompt(session_index: int) -> void:
 
 
 func _cancel_current_turn(session_index: int) -> void:
-	if session_index < 0 or session_index >= sessions.size():
+	if session_index < 0 or session_index >= _state.sessions.size():
 		return
 
-	var session: Dictionary = sessions[session_index]
+	var session: Dictionary = _state.sessions[session_index]
 	if not bool(session.get("busy", false)):
 		return
 	if bool(session.get("cancelling", false)):
@@ -3944,7 +3908,7 @@ func _cancel_current_turn(session_index: int) -> void:
 		return
 
 	session["cancelling"] = true
-	sessions[session_index] = session
+	_state.sessions[session_index] = session
 	_cancel_permission_requests_for_session(agent_id, remote_session_id)
 	connection.cancel_session(remote_session_id)
 	_refresh_send_state()
@@ -3953,8 +3917,8 @@ func _cancel_current_turn(session_index: int) -> void:
 
 func _cancel_permission_requests_for_session(agent_id: String, remote_session_id: String) -> void:
 	var to_cancel: Array = []
-	for request_id_variant in pending_permissions.keys():
-		var pending: Dictionary = pending_permissions[request_id_variant]
+	for request_id_variant in _state.pending_permissions.keys():
+		var pending: Dictionary = _state.pending_permissions[request_id_variant]
 		if str(pending.get("agent_id", "")) != agent_id:
 			continue
 		var pending_session_id: String = str(pending.get("remote_session_id", ""))
@@ -3966,14 +3930,14 @@ func _cancel_permission_requests_for_session(agent_id: String, remote_session_id
 
 
 func _ensure_connection(agent_id: String):
-	var existing = connections.get(agent_id, null)
+	var existing = _state.connections.get(agent_id, null)
 	if existing != null and is_instance_valid(existing):
-		var existing_status: String = str(connection_status.get(agent_id, ""))
+		var existing_status: String = str(_state.connection_status.get(agent_id, ""))
 		if existing_status != "error" and existing_status != "offline":
 			return existing
 		existing.shutdown()
 		existing.queue_free()
-		connections.erase(agent_id)
+		_state.connections.erase(agent_id)
 
 	var connection = ACPConnectionScript.new()
 	add_child(connection)
@@ -3994,14 +3958,14 @@ func _ensure_connection(agent_id: String):
 	connection.stderr_output.connect(Callable(self, "_on_connection_stderr_output"))
 	connection.fs_write_completed.connect(Callable(self, "_on_connection_fs_write_completed"))
 
-	connections[agent_id] = connection
-	connection_status[agent_id] = "starting"
-	pending_remote_sessions[agent_id] = pending_remote_sessions.get(agent_id, [])
-	pending_remote_session_loads[agent_id] = pending_remote_session_loads.get(agent_id, [])
+	_state.connections[agent_id] = connection
+	_state.connection_status[agent_id] = "starting"
+	_state.pending_remote_sessions[agent_id] = _state.pending_remote_sessions.get(agent_id, [])
+	_state.pending_remote_session_loads[agent_id] = _state.pending_remote_session_loads.get(agent_id, [])
 
 	if not connection.start(agent_id, _adapter_candidates(agent_id)):
-		connection_status[agent_id] = "offline"
-		connections.erase(agent_id)
+		_state.connection_status[agent_id] = "offline"
+		_state.connections.erase(agent_id)
 		connection.queue_free()
 		_append_system_message_to_agent(agent_id, GodetteI18n.t("Couldn't launch the local ACP adapter for %s.") % _agent_label(agent_id))
 		_refresh_status()
@@ -4011,10 +3975,10 @@ func _ensure_connection(agent_id: String):
 
 
 func _ensure_remote_session(session_index: int) -> bool:
-	if session_index < 0 or session_index >= sessions.size():
+	if session_index < 0 or session_index >= _state.sessions.size():
 		return false
 
-	var session: Dictionary = sessions[session_index]
+	var session: Dictionary = _state.sessions[session_index]
 	var remote_session_id: String = str(session.get("remote_session_id", ""))
 	if not remote_session_id.is_empty():
 		if bool(session.get("remote_session_loaded", false)):
@@ -4027,15 +3991,14 @@ func _ensure_remote_session(session_index: int) -> bool:
 		if load_connection == null:
 			return false
 
-		session["loading_remote_session"] = true
-		sessions[session_index] = session
+		_state.set_session_remote_loading(session_index, true)
 
-		var pending_loads: Array = pending_remote_session_loads.get(agent_id_for_load, [])
+		var pending_loads: Array = _state.pending_remote_session_loads.get(agent_id_for_load, [])
 		if pending_loads.find(str(session.get("id", ""))) < 0:
 			pending_loads.append(str(session.get("id", "")))
-		pending_remote_session_loads[agent_id_for_load] = pending_loads
+		_state.pending_remote_session_loads[agent_id_for_load] = pending_loads
 
-		if str(connection_status.get(agent_id_for_load, "")) == "ready":
+		if str(_state.connection_status.get(agent_id_for_load, "")) == "ready":
 			_flush_pending_session_loads(agent_id_for_load)
 
 		_refresh_status()
@@ -4049,15 +4012,14 @@ func _ensure_remote_session(session_index: int) -> bool:
 	if connection == null:
 		return false
 
-	session["creating_remote_session"] = true
-	sessions[session_index] = session
+	_state.set_session_remote_creating(session_index, true)
 
-	var pending: Array = pending_remote_sessions.get(agent_id, [])
+	var pending: Array = _state.pending_remote_sessions.get(agent_id, [])
 	if pending.find(str(session.get("id", ""))) < 0:
 		pending.append(str(session.get("id", "")))
-	pending_remote_sessions[agent_id] = pending
+	_state.pending_remote_sessions[agent_id] = pending
 
-	if str(connection_status.get(agent_id, "")) == "ready":
+	if str(_state.connection_status.get(agent_id, "")) == "ready":
 		_flush_pending_session_creates(agent_id)
 		_flush_pending_session_loads(agent_id)
 
@@ -4066,45 +4028,44 @@ func _ensure_remote_session(session_index: int) -> bool:
 
 
 func _flush_pending_session_creates(agent_id: String) -> void:
-	var connection = connections.get(agent_id, null)
+	var connection = _state.connections.get(agent_id, null)
 	if connection == null or not is_instance_valid(connection):
 		return
 
-	var pending: Array = pending_remote_sessions.get(agent_id, [])
+	var pending: Array = _state.pending_remote_sessions.get(agent_id, [])
 	if pending.is_empty():
 		return
 
-	pending_remote_sessions[agent_id] = []
+	_state.pending_remote_sessions[agent_id] = []
 	var project_root := ProjectSettings.globalize_path("res://")
 	for local_session_id in pending:
 		var session_index: int = _find_session_index_by_id(str(local_session_id))
 		if session_index < 0:
 			continue
-		var session: Dictionary = sessions[session_index]
+		var session: Dictionary = _state.sessions[session_index]
 		if not str(session.get("remote_session_id", "")).is_empty():
 			continue
 		if connection.create_session(str(session.get("id", "")), project_root) < 0:
-			session["creating_remote_session"] = false
-			sessions[session_index] = session
+			_state.set_session_remote_creating(session_index, false)
 			_append_transcript_to_session(session_index, "System", GodetteI18n.t("Couldn't create the remote ACP session."))
 
 
 func _flush_pending_session_loads(agent_id: String) -> void:
-	var connection = connections.get(agent_id, null)
+	var connection = _state.connections.get(agent_id, null)
 	if connection == null or not is_instance_valid(connection):
 		return
 
-	var pending: Array = pending_remote_session_loads.get(agent_id, [])
+	var pending: Array = _state.pending_remote_session_loads.get(agent_id, [])
 	if pending.is_empty():
 		return
 
-	pending_remote_session_loads[agent_id] = []
+	_state.pending_remote_session_loads[agent_id] = []
 	var project_root := _project_root_path()
 	for local_session_id in pending:
 		var session_index: int = _find_session_index_by_id(str(local_session_id))
 		if session_index < 0:
 			continue
-		var session: Dictionary = sessions[session_index]
+		var session: Dictionary = _state.sessions[session_index]
 		var remote_session_id: String = str(session.get("remote_session_id", ""))
 		if remote_session_id.is_empty():
 			continue
@@ -4114,11 +4075,18 @@ func _flush_pending_session_loads(agent_id: String) -> void:
 			str(session.get("agent_id", DEFAULT_AGENT_ID)),
 			remote_session_id,
 		]
-		replaying_sessions[replay_key] = true
+		_state.mark_session_replaying(
+			str(session.get("agent_id", DEFAULT_AGENT_ID)),
+			remote_session_id,
+			true,
+		)
 		if connection.load_session(str(session.get("id", "")), remote_session_id, project_root) < 0:
-			session["loading_remote_session"] = false
-			sessions[session_index] = session
-			replaying_sessions.erase(replay_key)
+			_state.set_session_remote_loading(session_index, false)
+			_state.mark_session_replaying(
+				str(session.get("agent_id", DEFAULT_AGENT_ID)),
+				remote_session_id,
+				false,
+			)
 			_append_transcript_to_session(session_index, "System", GodetteI18n.t("Couldn't load the existing remote ACP session."))
 
 
@@ -4176,9 +4144,9 @@ func _adapter_candidates(agent_id: String) -> Array:
 
 
 func _on_connection_initialized(agent_id: String, _result: Dictionary) -> void:
-	connection_status[agent_id] = "ready"
-	if startup_discovery_agents.has(agent_id):
-		var connection = connections.get(agent_id, null)
+	_state.connection_status[agent_id] = "ready"
+	if _state.startup_discovery_agents.has(agent_id):
+		var connection = _state.connections.get(agent_id, null)
 		if connection != null and is_instance_valid(connection):
 			connection.list_sessions(_project_root_path())
 	_flush_pending_session_creates(agent_id)
@@ -4191,18 +4159,27 @@ func _on_connection_session_created(agent_id: String, local_session_id: String, 
 	if session_index < 0:
 		return
 
-	var session: Dictionary = sessions[session_index]
-	session["remote_session_id"] = remote_session_id
-	session["remote_session_loaded"] = true
-	session["loading_remote_session"] = false
-	session["creating_remote_session"] = false
-	session["models"] = result.get("models", [])
-	session["modes"] = result.get("modes", [])
-	session["config_options"] = result.get("configOptions", [])
-	session["current_model_id"] = _selector_current_value(session.get("models", []), "currentModelId", "availableModels")
-	session["current_mode_id"] = _selector_current_value(session.get("modes", []), "currentModeId", "availableModes")
-	sessions[session_index] = session
-	_schedule_persist_state()
+	# Bulk fold remote-create payload onto state. Each setter dedups
+	# internally and emits its own narrow signal — views downstream can
+	# react to whichever fields actually changed.
+	_state.set_session_remote_loading(session_index, false)
+	_state.set_session_remote_creating(session_index, false)
+	_state.set_session_remote_attached(session_index, agent_id, remote_session_id)
+	_state.set_session_models(session_index, result.get("models", []))
+	_state.set_session_modes(session_index, result.get("modes", []))
+	_state.set_session_config_options(session_index, result.get("configOptions", []))
+	# `_selector_current_value` reads off the just-written models/modes
+	# to pick the agent's preferred default. Done after the setters
+	# above so we read freshly-applied data.
+	var session: Dictionary = _state.sessions[session_index]
+	_state.set_session_current_model_id(
+		session_index,
+		_selector_current_value(session.get("models", []), "currentModelId", "availableModels")
+	)
+	_state.set_session_current_mode_id(
+		session_index,
+		_selector_current_value(session.get("modes", []), "currentModeId", "availableModes")
+	)
 
 	if session_index == current_session_index:
 		_refresh_composer_options()
@@ -4215,22 +4192,42 @@ func _on_connection_session_loaded(agent_id: String, local_session_id: String, r
 	if session_index < 0:
 		return
 
-	var session: Dictionary = sessions[session_index]
-	session["remote_session_id"] = remote_session_id
-	session["remote_session_loaded"] = true
-	session["loading_remote_session"] = false
-	session["creating_remote_session"] = false
-	session["models"] = result.get("models", session.get("models", []))
-	session["modes"] = result.get("modes", session.get("modes", []))
-	session["config_options"] = result.get("configOptions", session.get("config_options", []))
-	session["current_model_id"] = _selector_current_value(session.get("models", []), "currentModelId", "availableModels", str(session.get("current_model_id", "")))
-	session["current_mode_id"] = _selector_current_value(session.get("modes", []), "currentModeId", "availableModes", str(session.get("current_mode_id", "")))
-	sessions[session_index] = session
+	# Same migration pattern as session_created. session/load is allowed
+	# to come back without re-emitting models / modes / config_options,
+	# in which case we fall back to whatever's already on the session.
+	_state.set_session_remote_loading(session_index, false)
+	_state.set_session_remote_creating(session_index, false)
+	_state.set_session_remote_attached(session_index, agent_id, remote_session_id)
+	var session: Dictionary = _state.sessions[session_index]
+	_state.set_session_models(session_index, result.get("models", session.get("models", [])))
+	_state.set_session_modes(session_index, result.get("modes", session.get("modes", [])))
+	_state.set_session_config_options(
+		session_index,
+		result.get("configOptions", session.get("config_options", []))
+	)
+	# Re-read after the writes above so we work against the freshest
+	# models / modes when picking the current selection.
+	session = _state.sessions[session_index]
+	_state.set_session_current_model_id(
+		session_index,
+		_selector_current_value(
+			session.get("models", []),
+			"currentModelId",
+			"availableModels",
+			str(session.get("current_model_id", ""))
+		)
+	)
+	_state.set_session_current_mode_id(
+		session_index,
+		_selector_current_value(
+			session.get("modes", []),
+			"currentModeId",
+			"availableModes",
+			str(session.get("current_mode_id", ""))
+		)
+	)
 
-	var replay_key: String = "%s|%s" % [str(session.get("agent_id", DEFAULT_AGENT_ID)), remote_session_id]
-	replaying_sessions.erase(replay_key)
-
-	_schedule_persist_state()
+	_state.mark_session_replaying(agent_id, remote_session_id, false)
 
 	if session_index == current_session_index:
 		_refresh_composer_options()
@@ -4252,14 +4249,11 @@ func _on_connection_session_load_failed(agent_id: String, local_session_id: Stri
 	if session_index < 0:
 		return
 
-	var session: Dictionary = sessions[session_index]
-	session["loading_remote_session"] = false
-	session["creating_remote_session"] = false
-	sessions[session_index] = session
+	_state.set_session_remote_loading(session_index, false)
+	_state.set_session_remote_creating(session_index, false)
+	_state.mark_session_replaying(agent_id, remote_session_id, false)
 
-	var replay_key: String = "%s|%s" % [str(session.get("agent_id", DEFAULT_AGENT_ID)), remote_session_id]
-	replaying_sessions.erase(replay_key)
-
+	var session: Dictionary = _state.sessions[session_index]
 	if _is_resource_missing_error(error_message):
 		var title: String = str(session.get("title", remote_session_id))
 		_evict_session(session_index)
@@ -4277,10 +4271,8 @@ func _on_connection_session_create_failed(agent_id: String, local_session_id: St
 		_append_system_message_to_agent(agent_id, GodetteI18n.t("Couldn't create a new session: %s") % error_message)
 		return
 
-	var session: Dictionary = sessions[session_index]
-	session["creating_remote_session"] = false
-	session["loading_remote_session"] = false
-	sessions[session_index] = session
+	_state.set_session_remote_loading(session_index, false)
+	_state.set_session_remote_creating(session_index, false)
 
 	_append_transcript_to_session(session_index, "System", GodetteI18n.t("Couldn't create this session: %s") % error_message)
 	_refresh_send_state()
@@ -4302,48 +4294,48 @@ func _is_resource_missing_error(error_message: String) -> bool:
 
 
 func _evict_session(session_index: int) -> void:
-	if session_index < 0 or session_index >= sessions.size():
+	if session_index < 0 or session_index >= _state.sessions.size():
 		return
-
-	var session: Dictionary = sessions[session_index]
+	# Pre-record the session's scope key so we can clear per-surface
+	# state (streaming buffers, plan-expanded flag) AFTER state.remove_session
+	# drops the session from the array. State takes care of the data side
+	# (transcript, tool calls, persist).
+	var session: Dictionary = _state.sessions[session_index]
 	var evicted_session_key: String = "%s|%s" % [
 		str(session.get("agent_id", DEFAULT_AGENT_ID)),
 		str(session.get("remote_session_id", "")),
 	]
-	# Drop view-local expand state that referenced this session.
 	var scope_prefix: String = evicted_session_key + "|"
-	_drop_keys_with_prefix(expanded_tool_calls, scope_prefix)
-	_drop_keys_with_prefix(expanded_thinking_blocks, scope_prefix)
-	_drop_keys_with_prefix(user_toggled_thinking_blocks, scope_prefix)
-	_drop_keys_with_prefix(streaming_pending, scope_prefix)
-	auto_expanded_thinking_block.erase(evicted_session_key)
-	plan_expanded_sessions.erase(evicted_session_key)
-	replaying_sessions.erase(evicted_session_key)
 
-	SessionStoreScript.delete_thread_cache(str(session.get("id", "")))
-	sessions.remove_at(session_index)
+	if not _state.remove_session(session_index, "dock"):
+		return
 	_schedule_managed_attachment_cleanup()
+
+	# Per-surface visual state (everything else moved to state). Streaming
+	# buffers + plan_expanded_sessions are dock-local — the streaming
+	# reveal loop and the drawer toggle live in this dock instance, not
+	# in shared state. Wiped here once state confirms the session is gone.
+	_drop_keys_with_prefix(streaming_pending, scope_prefix)
+	plan_expanded_sessions.erase(evicted_session_key)
 
 	if current_session_index == session_index:
 		current_session_index = -1
-		if not sessions.is_empty():
+		if not _state.sessions.is_empty():
 			_switch_session(_most_recent_session_index())
 		else:
 			_refresh_thread_menu()
 			_refresh_chat_log()
-			_create_session(selected_agent_id, true, true)
+			_create_session(_state.selected_agent_id, true, true)
 	elif current_session_index > session_index:
 		current_session_index -= 1
 		_refresh_thread_menu()
-
-	_schedule_persist_state()
 
 
 func _on_connection_sessions_listed(agent_id: String, remote_sessions: Array, next_cursor: String) -> void:
 	_import_remote_sessions(agent_id, remote_sessions)
 
 	if not next_cursor.is_empty():
-		var connection = connections.get(agent_id, null)
+		var connection = _state.connections.get(agent_id, null)
 		if connection != null and is_instance_valid(connection):
 			connection.list_sessions(_project_root_path(), next_cursor)
 		return
@@ -4365,7 +4357,7 @@ func _on_connection_session_update(agent_id: String, remote_session_id: String, 
 	# Suppress updates while replay is in flight; live events resume once
 	# _on_connection_session_loaded clears the replay flag.
 	var replay_key: String = "%s|%s" % [agent_id, remote_session_id]
-	if replaying_sessions.has(replay_key):
+	if _state.replaying_sessions.has(replay_key):
 		return
 
 	var update_kind := str(update.get("sessionUpdate", ""))
@@ -4400,9 +4392,9 @@ func _on_connection_session_update(agent_id: String, remote_session_id: String, 
 		"session_info_update":
 			_update_session_title_from_info(session_index, update)
 		"available_commands_update":
-			var session: Dictionary = sessions[session_index]
+			var session: Dictionary = _state.sessions[session_index]
 			session["available_commands"] = update
-			sessions[session_index] = session
+			_state.sessions[session_index] = session
 			var cmd_names: Array = []
 			for cmd_variant in update.get("availableCommands", []):
 				if typeof(cmd_variant) == TYPE_DICTIONARY:
@@ -4416,16 +4408,16 @@ func _on_connection_prompt_finished(agent_id: String, remote_session_id: String,
 	if session_index < 0:
 		return
 
-	var session: Dictionary = sessions[session_index]
+	var session: Dictionary = _state.sessions[session_index]
 	# Capture the streaming target before we clear it: the build seam uses
 	# `_is_assistant_entry_streaming` to choose layout, so we need to flip
 	# busy/assistant_entry_index off *first*, then re-build the entry to
 	# swap its single-TextBlock layout for the markdown blocks layout.
 	var prev_assistant_entry_index: int = int(session.get("assistant_entry_index", -1))
-	session["busy"] = false
 	session["cancelling"] = false
 	session["assistant_entry_index"] = -1
-	sessions[session_index] = session
+	_state.sessions[session_index] = session
+	_state.set_session_busy(session_index, false)
 
 	# Silently swallow normal terminations and user-initiated cancels —
 	# Zed's thread view does the same (no "Turn cancelled" system
@@ -4442,7 +4434,7 @@ func _on_connection_prompt_finished(agent_id: String, remote_session_id: String,
 	_flush_streaming_pending_for_session(session_index)
 	_finalize_auto_expanded_thoughts_for_session(session_index)
 	# Trigger the streaming → markdown swap. Only when this session is the
-	# foreground one — background sessions don't have their entries
+	# foreground one — background _state.sessions don't have their entries
 	# materialised in the visible feed, so the rebuild would be wasted work
 	# (re-materialisation when the user switches threads picks up the
 	# finalized layout anyway).
@@ -4495,7 +4487,7 @@ func _on_connection_permission_requested(agent_id: String, request_id: int, para
 	var options_variant = params.get("options", [])
 	var options: Array = options_variant if options_variant is Array else []
 
-	var connection = connections.get(agent_id, null)
+	var connection = _state.connections.get(agent_id, null)
 
 	if options.is_empty() or tool_call_id.is_empty():
 		if connection != null and is_instance_valid(connection):
@@ -4510,7 +4502,7 @@ func _on_connection_permission_requested(agent_id: String, request_id: int, para
 
 	_upsert_tool_call_entry(session_index, tool_call)
 
-	var session: Dictionary = sessions[session_index]
+	var session: Dictionary = _state.sessions[session_index]
 	var tool_calls: Dictionary = session.get("tool_calls", {})
 	var tool_state: Dictionary = tool_calls.get(tool_call_id, {})
 	var transcript_index: int = int(tool_state.get("transcript_index", -1))
@@ -4524,9 +4516,9 @@ func _on_connection_permission_requested(agent_id: String, request_id: int, para
 	entry["pending_permission_request_id"] = request_id
 	current_transcript[transcript_index] = entry
 	session["transcript"] = current_transcript
-	sessions[session_index] = session
+	_state.sessions[session_index] = session
 
-	pending_permissions[request_id] = {
+	_state.pending_permissions[request_id] = {
 		"agent_id": agent_id,
 		"remote_session_id": remote_session_id,
 		"tool_call_id": tool_call_id,
@@ -4538,14 +4530,14 @@ func _on_connection_permission_requested(agent_id: String, request_id: int, para
 
 
 func _on_connection_transport_status(agent_id: String, status: String) -> void:
-	connection_status[agent_id] = status
+	_state.connection_status[agent_id] = status
 	if status == "offline" or status == "error":
 		_finish_startup_discovery_for_agent(agent_id)
 	_refresh_status()
 
 
 func _on_connection_protocol_error(agent_id: String, message: String) -> void:
-	connection_status[agent_id] = "error"
+	_state.connection_status[agent_id] = "error"
 	_append_system_message_to_agent(agent_id, message)
 	_finish_startup_discovery_for_agent(agent_id)
 	_refresh_status()
@@ -4626,25 +4618,25 @@ func _default_permission_outcome(params: Dictionary) -> Dictionary:
 
 
 func _resolve_permission(request_id: int, outcome: Dictionary) -> void:
-	if not pending_permissions.has(request_id):
+	if not _state.pending_permissions.has(request_id):
 		return
 
-	var pending: Dictionary = pending_permissions[request_id]
+	var pending: Dictionary = _state.pending_permissions[request_id]
 	var agent_id: String = str(pending.get("agent_id", ""))
 	var remote_session_id: String = str(pending.get("remote_session_id", ""))
 	var tool_call_id: String = str(pending.get("tool_call_id", ""))
 
-	var connection = connections.get(agent_id, null)
+	var connection = _state.connections.get(agent_id, null)
 	if connection != null and is_instance_valid(connection):
 		connection.reply_permission(request_id, outcome)
 
-	pending_permissions.erase(request_id)
+	_state.pending_permissions.erase(request_id)
 
 	var session_index: int = _find_session_index_by_remote(agent_id, remote_session_id)
 	if session_index < 0:
 		return
 
-	var session: Dictionary = sessions[session_index]
+	var session: Dictionary = _state.sessions[session_index]
 	var tool_calls: Dictionary = session.get("tool_calls", {})
 	var tool_state: Dictionary = tool_calls.get(tool_call_id, {})
 	var transcript_index: int = int(tool_state.get("transcript_index", -1))
@@ -4655,17 +4647,17 @@ func _resolve_permission(request_id: int, outcome: Dictionary) -> void:
 			entry.erase("pending_permission_request_id")
 			current_transcript[transcript_index] = entry
 			session["transcript"] = current_transcript
-			sessions[session_index] = session
+			_state.sessions[session_index] = session
 
 	if session_index == current_session_index and transcript_index >= 0:
 		_update_entry_in_feed(transcript_index)
 
 
 func _on_permission_option_pressed(request_id: int, option_index: int) -> void:
-	if not pending_permissions.has(request_id):
+	if not _state.pending_permissions.has(request_id):
 		return
 
-	var pending: Dictionary = pending_permissions[request_id]
+	var pending: Dictionary = _state.pending_permissions[request_id]
 	var options: Array = pending.get("options", [])
 	if option_index < 0 or option_index >= options.size():
 		_resolve_permission(request_id, {"outcome": "cancelled"})
@@ -5430,7 +5422,7 @@ func _build_session_popup_groups() -> Array:
 	# Using the same two-section structure keeps the user's spatial
 	# memory ("this thread was near the top") stable across the refactor.
 	var groups: Array = []
-	if sessions.is_empty():
+	if _state.sessions.is_empty():
 		return groups
 
 	var recent_indices: Array = _recent_session_indices(RECENT_SESSION_LIMIT)
@@ -5443,9 +5435,9 @@ func _build_session_popup_groups() -> Array:
 	if not recent_group["indices"].is_empty():
 		groups.append(recent_group)
 
-	if sessions.size() > recent_indices.size():
+	if _state.sessions.size() > recent_indices.size():
 		var all_group: Dictionary = {"header": GodetteI18n.t("All Sessions"), "indices": []}
-		for session_index in range(sessions.size()):
+		for session_index in range(_state.sessions.size()):
 			if listed.has(session_index):
 				continue
 			all_group["indices"].append(session_index)
@@ -5468,9 +5460,9 @@ func _populate_session_popup() -> void:
 
 
 func _session_popup_agent_icon(session_index: int) -> Texture2D:
-	if session_index < 0 or session_index >= sessions.size():
+	if session_index < 0 or session_index >= _state.sessions.size():
 		return null
-	var agent_id: String = str(sessions[session_index].get("agent_id", DEFAULT_AGENT_ID))
+	var agent_id: String = str(_state.sessions[session_index].get("agent_id", DEFAULT_AGENT_ID))
 	return _agent_icon_texture(agent_id, THREAD_MENU_AGENT_ICON_SIZE)
 
 
@@ -5873,7 +5865,7 @@ func _refresh_composer_options() -> void:
 		call_deferred("_reflow_composer_selectors")
 		return
 
-	var session: Dictionary = sessions[current_session_index]
+	var session: Dictionary = _state.sessions[current_session_index]
 	var agent_id: String = str(session.get("agent_id", DEFAULT_AGENT_ID))
 
 	var config_options: Array = _normalized_config_options(session)
@@ -5950,7 +5942,7 @@ func _refresh_send_state() -> void:
 		_refresh_queue_indicator()
 		return
 
-	var session: Dictionary = sessions[current_session_index]
+	var session: Dictionary = _state.sessions[current_session_index]
 	var busy: bool = bool(session.get("busy", false))
 	var cancelling: bool = bool(session.get("cancelling", false))
 	# Three-state send button (matches Zed):
@@ -5986,7 +5978,7 @@ func _composer_has_content() -> bool:
 	else:
 		if not prompt_input.text.strip_edges().is_empty():
 			return true
-	if current_session_index >= 0 and current_session_index < sessions.size():
+	if current_session_index >= 0 and current_session_index < _state.sessions.size():
 		var attachments := _session_attachments(current_session_index)
 		if not attachments.is_empty():
 			return true
@@ -6006,8 +5998,8 @@ func _refresh_loading_scanner() -> void:
 	if loading_scanner == null:
 		return
 	var should_show: bool = false
-	if current_session_index >= 0 and current_session_index < sessions.size():
-		var session: Dictionary = sessions[current_session_index]
+	if current_session_index >= 0 and current_session_index < _state.sessions.size():
+		var session: Dictionary = _state.sessions[current_session_index]
 		should_show = bool(session.get("loading_remote_session", false)) \
 			or bool(session.get("creating_remote_session", false)) \
 			or bool(session.get("busy", false))
@@ -6035,9 +6027,9 @@ func _refresh_status() -> void:
 			status_dot.tooltip_text = no_session_text
 		return
 
-	var session: Dictionary = sessions[current_session_index]
+	var session: Dictionary = _state.sessions[current_session_index]
 	var agent_id: String = str(session.get("agent_id", DEFAULT_AGENT_ID))
-	var status: String = str(connection_status.get(agent_id, "starting"))
+	var status: String = str(_state.connection_status.get(agent_id, "starting"))
 	var status_key := "Connecting"
 	var dot_color := Color(0.81, 0.66, 0.27, 0.95)
 
@@ -6122,7 +6114,7 @@ func _on_config_menu_id_pressed(item_id: int, popup: PopupMenu, config_id: Strin
 	if item_id < 0 or item_id >= popup.get_item_count():
 		return
 
-	var session: Dictionary = sessions[current_session_index]
+	var session: Dictionary = _state.sessions[current_session_index]
 	var remote_session_id: String = str(session.get("remote_session_id", ""))
 	if remote_session_id.is_empty():
 		return
@@ -6144,7 +6136,7 @@ func _on_mode_menu_id_pressed(item_id: int, popup: PopupMenu) -> void:
 	if item_id < 0 or item_id >= popup.get_item_count():
 		return
 
-	var session: Dictionary = sessions[current_session_index]
+	var session: Dictionary = _state.sessions[current_session_index]
 	var remote_session_id: String = str(session.get("remote_session_id", ""))
 	if remote_session_id.is_empty():
 		return
@@ -6166,7 +6158,7 @@ func _on_model_menu_id_pressed(item_id: int, popup: PopupMenu) -> void:
 	if item_id < 0 or item_id >= popup.get_item_count():
 		return
 
-	var session: Dictionary = sessions[current_session_index]
+	var session: Dictionary = _state.sessions[current_session_index]
 	var remote_session_id: String = str(session.get("remote_session_id", ""))
 	if remote_session_id.is_empty():
 		return
@@ -6183,10 +6175,10 @@ func _on_model_menu_id_pressed(item_id: int, popup: PopupMenu) -> void:
 
 
 func _apply_config_option_value(session_index: int, config_id: String, value: String) -> void:
-	if session_index < 0 or session_index >= sessions.size():
+	if session_index < 0 or session_index >= _state.sessions.size():
 		return
 
-	var session: Dictionary = sessions[session_index]
+	var session: Dictionary = _state.sessions[session_index]
 	var config_options: Array = session.get("config_options", [])
 	for option_index in range(config_options.size()):
 		if typeof(config_options[option_index]) != TYPE_DICTIONARY:
@@ -6199,68 +6191,71 @@ func _apply_config_option_value(session_index: int, config_id: String, value: St
 		break
 	session["config_options"] = config_options
 	if config_id == "mode":
-		session["current_mode_id"] = value
 		if typeof(session.get("modes", [])) == TYPE_DICTIONARY:
 			var modes: Dictionary = session.get("modes", {})
 			if not modes.is_empty():
 				modes["currentModeId"] = value
 				session["modes"] = modes
-	if config_id == "model":
-		session["current_model_id"] = value
-	sessions[session_index] = session
+		_state.sessions[session_index] = session
+		_state.set_session_current_mode_id(session_index, value)
+	elif config_id == "model":
+		_state.sessions[session_index] = session
+		_state.set_session_current_model_id(session_index, value)
+	else:
+		_state.sessions[session_index] = session
 
 	if session_index == current_session_index:
 		_refresh_composer_options()
 
 
 func _update_session_mode_state(session_index: int, mode_id: String) -> void:
-	if session_index < 0 or session_index >= sessions.size():
+	if session_index < 0 or session_index >= _state.sessions.size():
 		return
 
-	var session: Dictionary = sessions[session_index]
-	session["current_mode_id"] = mode_id
+	var session: Dictionary = _state.sessions[session_index]
 	if typeof(session.get("modes", [])) == TYPE_DICTIONARY:
 		var modes: Dictionary = session.get("modes", {})
 		if not modes.is_empty():
 			modes["currentModeId"] = mode_id
 			session["modes"] = modes
-	sessions[session_index] = session
+	_state.sessions[session_index] = session
+	_state.set_session_current_mode_id(session_index, mode_id)
 
 	if session_index == current_session_index:
 		_refresh_composer_options()
 
 
 func _update_session_model_state(session_index: int, model_id: String) -> void:
-	if session_index < 0 or session_index >= sessions.size():
+	if session_index < 0 or session_index >= _state.sessions.size():
 		return
 
-	var session: Dictionary = sessions[session_index]
-	session["current_model_id"] = model_id
+	var session: Dictionary = _state.sessions[session_index]
 	if typeof(session.get("models", [])) == TYPE_DICTIONARY:
 		var models: Dictionary = session.get("models", {})
 		if not models.is_empty():
 			models["currentModelId"] = model_id
 			session["models"] = models
-	sessions[session_index] = session
+	_state.sessions[session_index] = session
+	_state.set_session_current_model_id(session_index, model_id)
 
 	if session_index == current_session_index:
 		_refresh_composer_options()
 
 
 func _update_session_config_options(session_index: int, config_options: Array) -> void:
-	if session_index < 0 or session_index >= sessions.size():
+	if session_index < 0 or session_index >= _state.sessions.size():
 		return
 
-	var session: Dictionary = sessions[session_index]
+	var session: Dictionary = _state.sessions[session_index]
 	session["config_options"] = config_options
-	sessions[session_index] = session
+	_state.sessions[session_index] = session
 
 	if session_index == current_session_index:
 		_refresh_composer_options()
 
 
 func _update_session_title_from_info(session_index: int, update: Dictionary) -> void:
-	if session_index < 0 or session_index >= sessions.size():
+	if session_index < 0 or session_index >= _state.sessions.size():
 		return
 
 	if not update.has("title"):
@@ -6269,11 +6264,7 @@ func _update_session_title_from_info(session_index: int, update: Dictionary) -> 
 	var title: String = str(update.get("title", "")).strip_edges()
 	if title.is_empty():
 		return
-
-	var session: Dictionary = sessions[session_index]
-	session["title"] = title
-	sessions[session_index] = session
-	_touch_session(session_index)
+	_state.set_session_title(session_index, title)
 	_refresh_thread_menu()
 
 
@@ -6289,8 +6280,8 @@ func _import_remote_sessions(agent_id: String, remote_sessions: Array) -> void:
 	var imported_any := false
 	var current_best_index := current_session_index
 	var current_best_updated_at := -1
-	if current_best_index >= 0 and current_best_index < sessions.size():
-		current_best_updated_at = int(sessions[current_best_index].get("updated_at", 0))
+	if current_best_index >= 0 and current_best_index < _state.sessions.size():
+		current_best_updated_at = int(_state.sessions[current_best_index].get("updated_at", 0))
 
 	for remote_session_variant in remote_sessions:
 		if typeof(remote_session_variant) != TYPE_DICTIONARY:
@@ -6310,10 +6301,10 @@ func _import_remote_sessions(agent_id: String, remote_sessions: Array) -> void:
 
 		var title: String = _safe_text(str(remote_session.get("title", "")).strip_edges())
 		if title.is_empty():
-			title = "Session %d" % next_session_number
+			title = "Session %d" % _state.next_session_number
 
 		var session: Dictionary = {
-			"id": "session_%d" % next_session_number,
+			"id": "session_%d" % _state.next_session_number,
 			"title": title,
 			"agent_id": agent_id,
 			"remote_session_id": remote_session_id,
@@ -6339,10 +6330,10 @@ func _import_remote_sessions(agent_id: String, remote_sessions: Array) -> void:
 			"updated_at": _timestamp_msec_from_iso(str(remote_session.get("updatedAt", ""))),
 			"created_at": _timestamp_msec_from_iso(str(remote_session.get("createdAt", remote_session.get("updatedAt", "")))),
 		}
-		next_session_number += 1
-		sessions.append(session)
+		_state.next_session_number += 1
+		_state.sessions.append(session)
 		imported_any = true
-		var appended_index := sessions.size() - 1
+		var appended_index := _state.sessions.size() - 1
 		var appended_updated_at: int = int(session.get("updated_at", 0))
 		if current_best_index < 0 or appended_updated_at > current_best_updated_at:
 			current_best_index = appended_index
@@ -6355,57 +6346,30 @@ func _import_remote_sessions(agent_id: String, remote_sessions: Array) -> void:
 		# the user was last on — don't clobber it just because `session/list`
 		# found a remote thread with a newer updated_at. The newly imported
 		# thread still shows up in the thread menu for manual switching.
-		if current_session_index < 0 and current_best_index >= 0 and current_best_index < sessions.size():
+		if current_session_index < 0 and current_best_index >= 0 and current_best_index < _state.sessions.size():
 			_switch_session(current_best_index)
 		_schedule_persist_state()
 
 
 func _create_session(agent_id: String, switch_to_new: bool, connect_remote: bool) -> void:
-	var title: String = "Session %d" % next_session_number
-	var session: Dictionary = {
-		"id": "session_%d" % next_session_number,
-		"title": title,
-		"agent_id": agent_id,
-		"remote_session_id": "",
-		"remote_session_loaded": false,
-		"loading_remote_session": false,
-		"creating_remote_session": false,
-		"attachments": [],
-		"managed_attachment_refs": [],
-		"transcript": [],
-		"assistant_entry_index": -1,
-		"plan_entries": [],
-		"queued_prompts": [],
-		"tool_calls": {},
-		"available_commands": {},
-		"models": [],
-		"modes": [],
-		"config_options": [],
-		"current_model_id": "",
-		"current_mode_id": "",
-		"cancelling": false,
-		"busy": false,
-		"hydrated": true,
-		"updated_at": _now_tick(),
-		"created_at": _now_tick(),
-	}
-	next_session_number += 1
-	sessions.append(session)
+	# State owns the _state.sessions array + the _state.next_session_number counter +
+	# the persist scheduling. Dock keeps the post-create UI work
+	# (thread menu refresh, switch, remote attach).
+	var new_index: int = _state.create_session(agent_id)
+	if new_index < 0:
+		return
 	_refresh_thread_menu()
 
-	var new_index := sessions.size() - 1
 	if switch_to_new:
 		_switch_session(new_index)
 
 	if connect_remote:
 		_ensure_remote_session(new_index)
 		_refresh_status()
-	else:
-		_schedule_persist_state()
 
 
 func _switch_session(index: int) -> void:
-	if index < 0 or index >= sessions.size():
+	if index < 0 or index >= _state.sessions.size():
 		return
 
 	# Dropping pending streaming for the leaving session: its TextBlocks are
@@ -6426,20 +6390,24 @@ func _switch_session(index: int) -> void:
 	# attachments on restore — the draft only needs to remember WHICH
 	# chips were placed where.
 	if inline_prompt != null and previous_session_index != index \
-			and previous_session_index >= 0 and previous_session_index < sessions.size():
-		sessions[previous_session_index]["composer_draft"] = inline_prompt.serialize_draft()
-	if previous_session_index != index and previous_session_index >= 0 and previous_session_index < sessions.size():
-		SessionStoreScript.dehydrate(sessions[previous_session_index])
-	SessionStoreScript.hydrate(sessions[index])
+			and previous_session_index >= 0 and previous_session_index < _state.sessions.size():
+		_state.sessions[previous_session_index]["composer_draft"] = inline_prompt.serialize_draft()
+	if previous_session_index != index and previous_session_index >= 0 and previous_session_index < _state.sessions.size():
+		SessionStoreScript.dehydrate(_state.sessions[previous_session_index])
+	SessionStoreScript.hydrate(_state.sessions[index])
 
 	current_session_index = index
-	selected_agent_id = str(sessions[index].get("agent_id", DEFAULT_AGENT_ID))
+	_state.selected_agent_id = str(_state.sessions[index].get("agent_id", DEFAULT_AGENT_ID))
+	# Surface claim follows the active session immediately so state's view
+	# of "the dock is on session N" is fresh from this point on, not just
+	# at the next persist tick.
+	_state.set_current_session_for_surface("dock", index)
 
 	# Restore the incoming session's draft (if any) before the refresh
 	# passes run — _refresh_composer_context will then diff chip state
 	# against session.attachments and no-op if the restore already matches.
 	if inline_prompt != null:
-		var draft_variant = sessions[index].get("composer_draft", {})
+		var draft_variant = _state.sessions[index].get("composer_draft", {})
 		if typeof(draft_variant) == TYPE_DICTIONARY and not (draft_variant as Dictionary).is_empty():
 			inline_prompt.restore_draft(draft_variant, _build_chip_metadata_lookup(index))
 		else:
@@ -6462,17 +6430,17 @@ func _append_user_message_to_session(session_index: int, text: String, segments:
 	_append_transcript_to_session(session_index, "You", text, segments)
 	# Capture the first user message as a derived title on the session
 	# metadata so the thread menu shows real content (not "Session 14")
-	# for sessions other than the currently hydrated one. Only set it
+	# for _state.sessions other than the currently hydrated one. Only set it
 	# ONCE — the session's identity is anchored to its first message,
 	# not the latest.
-	if session_index < 0 or session_index >= sessions.size():
+	if session_index < 0 or session_index >= _state.sessions.size():
 		return
-	var session: Dictionary = sessions[session_index]
+	var session: Dictionary = _state.sessions[session_index]
 	if str(session.get("derived_title", "")).strip_edges().is_empty():
 		var snippet := _snippet_from_user_text(text)
 		if not snippet.is_empty():
 			session["derived_title"] = snippet
-			sessions[session_index] = session
+			_state.sessions[session_index] = session
 			_schedule_persist_state()
 
 
@@ -6501,15 +6469,12 @@ func _append_system_message_to_agent(agent_id: String, text: String) -> void:
 
 
 func _append_transcript_to_session(session_index: int, speaker: String, text: String, segments: Array = []) -> void:
-	if session_index < 0 or session_index >= sessions.size():
+	if session_index < 0 or session_index >= _state.sessions.size():
 		return
-
-	var session: Dictionary = sessions[session_index]
-	var current_transcript: Array = session.get("transcript", [])
 	var entry: Dictionary = {
 		"kind": _entry_kind({"speaker": speaker}),
 		"speaker": speaker,
-		"content": text
+		"content": text,
 	}
 	# Only user messages carry segments today; the renderer falls back to
 	# `content` whenever `segments` is absent, which keeps assistant /
@@ -6517,51 +6482,36 @@ func _append_transcript_to_session(session_index: int, speaker: String, text: St
 	# before this field existed) render as plain text.
 	if not segments.is_empty():
 		entry["segments"] = segments
-	current_transcript.append(entry)
-	var new_index: int = current_transcript.size() - 1
-	# Any non-assistant / non-thought entry breaks the streaming continuity.
-	# Without this reset, a session/load replay (which does not emit a
-	# prompt_finished between past turns) would keep appending subsequent
-	# assistant chunks into the first past assistant message.
-	session["assistant_entry_index"] = -1
-	session["thought_entry_index"] = -1
-	session["transcript"] = current_transcript
-	sessions[session_index] = session
-	_touch_session(session_index)
-
+	# State owns the transcript array + persist scheduling; dock owns the
+	# per-surface UI (thread menu list, VirtualFeed entry build).
+	var new_index: int = _state.append_transcript_entry(session_index, entry)
+	if new_index < 0:
+		return
+	_refresh_thread_menu()
 	if session_index == current_session_index:
 		_append_entry_to_feed(new_index)
 
 
 func _append_agent_chunk_to_session(session_index: int, text: String) -> void:
-	var session: Dictionary = sessions[session_index]
-	var current_transcript: Array = session.get("transcript", [])
-	var assistant_entry_index := int(session.get("assistant_entry_index", -1))
-	var is_new_entry: bool = assistant_entry_index < 0 or assistant_entry_index >= current_transcript.size()
-	if is_new_entry:
-		current_transcript.append({
-			"kind": "assistant",
-			"speaker": _agent_label(str(session.get("agent_id", DEFAULT_AGENT_ID))),
-			"content": text
-		})
-		assistant_entry_index = current_transcript.size() - 1
-		session["assistant_entry_index"] = assistant_entry_index
-	else:
-		var entry: Dictionary = current_transcript[assistant_entry_index]
-		entry["content"] = str(entry.get("content", "")) + text
-		current_transcript[assistant_entry_index] = entry
-
-	# A normal assistant chunk ends any in-flight thought streaming segment.
-	session["thought_entry_index"] = -1
-	session["transcript"] = current_transcript
-	sessions[session_index] = session
-	_touch_session(session_index)
+	if session_index < 0 or session_index >= _state.sessions.size():
+		return
+	var session: Dictionary = _state.sessions[session_index]
+	var speaker_label: String = _agent_label(str(session.get("agent_id", DEFAULT_AGENT_ID)))
+	# State handles the streaming-continuity decision (new entry vs append
+	# to existing) and signals back through `is_new`.
+	var info: Dictionary = _state.append_assistant_chunk(session_index, text, speaker_label)
+	var is_new_entry: bool = bool(info.get("is_new", false))
+	var assistant_entry_index: int = int(info.get("entry_index", -1))
+	if assistant_entry_index < 0:
+		return
+	_refresh_thread_menu()
 	if session_index == current_session_index:
 		if is_new_entry:
 			_append_entry_to_feed(assistant_entry_index)
 		else:
-			# Active turn => smooth reveal via buffer; replay / idle appends
-			# bypass it so long history doesn't dribble character-by-character.
+			# Active turn => smooth reveal via buffer; replay / idle
+			# appends bypass it so long history doesn't dribble character-
+			# by-character.
 			if bool(session.get("busy", false)):
 				_queue_streaming_delta(session, assistant_entry_index, text)
 			else:
@@ -6569,38 +6519,22 @@ func _append_agent_chunk_to_session(session_index: int, text: String) -> void:
 
 
 func _append_thought_chunk_to_session(session_index: int, text: String) -> void:
-	var session: Dictionary = sessions[session_index]
-	var current_transcript: Array = session.get("transcript", [])
-	var thought_entry_index := int(session.get("thought_entry_index", -1))
-	var is_new_entry: bool = thought_entry_index < 0 or thought_entry_index >= current_transcript.size()
-	var entry_index: int
-	if is_new_entry:
-		current_transcript.append({
-			"kind": "thought",
-			"speaker": "Thinking",
-			"content": text
-		})
-		entry_index = current_transcript.size() - 1
-		session["thought_entry_index"] = entry_index
-	else:
-		var entry: Dictionary = current_transcript[thought_entry_index]
-		entry["content"] = str(entry.get("content", "")) + text
-		current_transcript[thought_entry_index] = entry
-		entry_index = thought_entry_index
-
-	# Thought chunks interrupt any running assistant message segment: next
-	# assistant_message_chunk should start a new entry.
-	session["assistant_entry_index"] = -1
-	session["transcript"] = current_transcript
-	sessions[session_index] = session
+	if session_index < 0 or session_index >= _state.sessions.size():
+		return
+	var session: Dictionary = _state.sessions[session_index]
+	var info: Dictionary = _state.append_thought_chunk(session_index, text, "Thinking")
+	var is_new_entry: bool = bool(info.get("is_new", false))
+	var entry_index: int = int(info.get("entry_index", -1))
+	if entry_index < 0:
+		return
 
 	var thought_key: String = _thinking_block_key(session, entry_index)
 	if not thought_key.is_empty():
-		expanded_thinking_blocks[thought_key] = true
+		_state.expanded_thinking_blocks[thought_key] = true
 		var scope_key: String = "%s|%s" % [str(session.get("agent_id", DEFAULT_AGENT_ID)), str(session.get("remote_session_id", ""))]
-		auto_expanded_thinking_block[scope_key] = thought_key
+		_state.auto_expanded_thinking_block[scope_key] = thought_key
 
-	_touch_session(session_index)
+	_refresh_thread_menu()
 	if session_index == current_session_index:
 		if is_new_entry:
 			_append_entry_to_feed(entry_index)
@@ -6706,19 +6640,19 @@ func _thinking_block_key(session: Dictionary, entry_index: int) -> String:
 
 
 func _finalize_auto_expanded_thoughts_for_session(session_index: int) -> void:
-	if session_index < 0 or session_index >= sessions.size():
+	if session_index < 0 or session_index >= _state.sessions.size():
 		return
-	var session: Dictionary = sessions[session_index]
+	var session: Dictionary = _state.sessions[session_index]
 	var scope_key: String = "%s|%s" % [str(session.get("agent_id", DEFAULT_AGENT_ID)), str(session.get("remote_session_id", ""))]
-	var auto_key: String = str(auto_expanded_thinking_block.get(scope_key, ""))
+	var auto_key: String = str(_state.auto_expanded_thinking_block.get(scope_key, ""))
 	if auto_key.is_empty():
 		return
-	var was_user_toggled: bool = user_toggled_thinking_blocks.has(auto_key)
+	var was_user_toggled: bool = _state.user_toggled_thinking_blocks.has(auto_key)
 	if not was_user_toggled:
-		expanded_thinking_blocks.erase(auto_key)
-	auto_expanded_thinking_block.erase(scope_key)
+		_state.expanded_thinking_blocks.erase(auto_key)
+	_state.auto_expanded_thinking_block.erase(scope_key)
 	session["thought_entry_index"] = -1
-	sessions[session_index] = session
+	_state.sessions[session_index] = session
 
 	if session_index != current_session_index:
 		return
@@ -6733,7 +6667,7 @@ func _finalize_auto_expanded_thoughts_for_session(session_index: int) -> void:
 
 
 func _upsert_plan_entry(session_index: int, entries_variant) -> void:
-	if session_index < 0 or session_index >= sessions.size():
+	if session_index < 0 or session_index >= _state.sessions.size():
 		return
 
 	var normalized_entries: Array = []
@@ -6748,38 +6682,30 @@ func _upsert_plan_entry(session_index: int, entries_variant) -> void:
 				"priority": str(incoming_entry.get("priority", "medium"))
 			})
 
-	var session: Dictionary = sessions[session_index]
-	session["plan_entries"] = normalized_entries
-
-	# A fresh plan update un-dismisses the drawer — users expect the panel
-	# to reappear when the agent actually changes its plan, even if they
-	# × closed the previous version.
-	var session_scope_key := "%s|%s" % [
-		str(session.get("agent_id", DEFAULT_AGENT_ID)),
-		str(session.get("remote_session_id", "")),
-	]
-	plan_dismissed_sessions.erase(session_scope_key)
-
-	sessions[session_index] = session
-	_touch_session(session_index)
+	# State stores the entries, clears the dismissed flag, schedules
+	# persist; dock only handles per-surface UI (thread menu + drawer).
+	_state.replace_plan(session_index, normalized_entries)
+	_refresh_thread_menu()
 
 	if session_index == current_session_index:
 		_refresh_plan_drawer()
 
 
 func _upsert_tool_call_entry(session_index: int, update: Dictionary) -> void:
-	if session_index < 0 or session_index >= sessions.size():
+	if session_index < 0 or session_index >= _state.sessions.size():
 		return
 
 	var tool_call_id: String = str(update.get("toolCallId", ""))
 	if tool_call_id.is_empty():
 		return
 
-	var session: Dictionary = sessions[session_index]
+	# Fold the incoming `update` into the persisted tool_state for this
+	# call (titles / kind / status / raw_input). State stores the merged
+	# tool_state + transcript entry; dock here just builds the formatted
+	# display strings + the entry dict.
+	var session: Dictionary = _state.sessions[session_index]
 	var tool_calls: Dictionary = session.get("tool_calls", {})
-	var tool_state: Dictionary = tool_calls.get(tool_call_id, {})
-	var current_transcript: Array = session.get("transcript", [])
-
+	var tool_state: Dictionary = tool_calls.get(tool_call_id, {}).duplicate()
 	tool_state["toolCallId"] = tool_call_id
 	if update.has("title"):
 		tool_state["title"] = str(update.get("title", "Tool"))
@@ -6792,11 +6718,10 @@ func _upsert_tool_call_entry(session_index: int, update: Dictionary) -> void:
 	if not summary.is_empty():
 		tool_state["summary"] = summary
 
-	# Preserve the pretty-printed raw input on the tool_state so the renderer
-	# can show a "Raw Input" section that matches Zed's thread_view (which
-	# always surfaces the literal JSON the agent sent, not the sanitised
-	# summary). Stored as a string so it survives transcript serialisation
-	# identically to the other entry fields.
+	# Preserve the pretty-printed raw input on the tool_state so the
+	# renderer can show a "Raw Input" section that matches Zed's
+	# thread_view. Stored as a string so it survives transcript
+	# serialisation identically to the other entry fields.
 	var raw_input_variant = update.get("rawInput", null)
 	if raw_input_variant != null:
 		if typeof(raw_input_variant) == TYPE_DICTIONARY or typeof(raw_input_variant) == TYPE_ARRAY:
@@ -6805,44 +6730,24 @@ func _upsert_tool_call_entry(session_index: int, update: Dictionary) -> void:
 			tool_state["raw_input"] = str(raw_input_variant)
 
 	var content: String = _format_tool_call_entry(tool_state)
-	var transcript_index: int = int(tool_state.get("transcript_index", -1))
+	var transcript_entry: Dictionary = {
+		"kind": "tool",
+		"speaker": "Tool",
+		"tool_call_id": tool_call_id,
+		"title": str(tool_state.get("title", "Tool")),
+		"summary": str(tool_state.get("summary", "")),
+		"status": str(tool_state.get("status", "pending")),
+		"tool_kind": str(tool_state.get("kind", "")),
+		"raw_input": str(tool_state.get("raw_input", "")),
+		"content": content,
+	}
 
-	var tool_is_new := false
-	if transcript_index >= 0 and transcript_index < current_transcript.size():
-		var entry: Dictionary = current_transcript[transcript_index]
-		entry["kind"] = "tool"
-		entry["speaker"] = "Tool"
-		entry["tool_call_id"] = tool_call_id
-		entry["title"] = str(tool_state.get("title", "Tool"))
-		entry["summary"] = str(tool_state.get("summary", ""))
-		entry["status"] = str(tool_state.get("status", "pending"))
-		entry["tool_kind"] = str(tool_state.get("kind", ""))
-		entry["raw_input"] = str(tool_state.get("raw_input", ""))
-		entry["content"] = content
-		current_transcript[transcript_index] = entry
-	else:
-		current_transcript.append({
-			"kind": "tool",
-			"speaker": "Tool",
-			"tool_call_id": tool_call_id,
-			"title": str(tool_state.get("title", "Tool")),
-			"summary": str(tool_state.get("summary", "")),
-			"status": str(tool_state.get("status", "pending")),
-			"tool_kind": str(tool_state.get("kind", "")),
-			"raw_input": str(tool_state.get("raw_input", "")),
-			"content": content
-		})
-		transcript_index = current_transcript.size() - 1
-		tool_state["transcript_index"] = transcript_index
-		tool_is_new = true
-		session["assistant_entry_index"] = -1
-		session["thought_entry_index"] = -1
-
-	tool_calls[tool_call_id] = tool_state
-	session["tool_calls"] = tool_calls
-	session["transcript"] = current_transcript
-	sessions[session_index] = session
-	_touch_session(session_index)
+	var info: Dictionary = _state.upsert_tool_call(session_index, tool_call_id, tool_state, transcript_entry)
+	var tool_is_new: bool = bool(info.get("is_new", false))
+	var transcript_index: int = int(info.get("transcript_index", -1))
+	if transcript_index < 0:
+		return
+	_refresh_thread_menu()
 
 	if session_index == current_session_index:
 		if tool_is_new:
@@ -6902,29 +6807,26 @@ func _format_tool_call_entry(tool_state: Dictionary) -> String:
 
 
 func _session_attachments(session_index: int) -> Array:
-	if session_index < 0 or session_index >= sessions.size():
+	if session_index < 0 or session_index >= _state.sessions.size():
 		return []
-	return sessions[session_index].get("attachments", [])
+	return _state.sessions[session_index].get("attachments", [])
 
 
 func _set_session_attachments(session_index: int, attachments: Array) -> void:
-	if session_index < 0 or session_index >= sessions.size():
+	if session_index < 0 or session_index >= _state.sessions.size():
 		return
-
-	var session: Dictionary = sessions[session_index]
-	session["attachments"] = attachments
-	sessions[session_index] = session
-	_touch_session(session_index)
+	_state.set_session_attachments(session_index, attachments)
+	_refresh_thread_menu()
 	# Cleanup only fires on dock startup and session deletion. Per-change
 	# scanning every time attachments mutate (add, remove, send-consume)
 	# is wasted disk I/O: orphans can wait until the next startup, and
-	# attachments in active sessions must be kept alive anyway.
+	# attachments in active _state.sessions must be kept alive anyway.
 
 
 func _session_transcript(session_index: int) -> Array:
-	if session_index < 0 or session_index >= sessions.size():
+	if session_index < 0 or session_index >= _state.sessions.size():
 		return []
-	return sessions[session_index].get("transcript", [])
+	return _state.sessions[session_index].get("transcript", [])
 
 
 func _attachments_has_key(current_attachments: Array, key: String) -> bool:
@@ -7088,24 +6990,24 @@ func _describe_node(node: Node) -> String:
 
 
 func _find_session_index_by_id(session_id: String) -> int:
-	for index in range(sessions.size()):
-		if str(sessions[index].get("id", "")) == session_id:
+	for index in range(_state.sessions.size()):
+		if str(_state.sessions[index].get("id", "")) == session_id:
 			return index
 	return -1
 
 
 func _find_session_index_by_remote(agent_id: String, remote_session_id: String) -> int:
-	for index in range(sessions.size()):
-		if str(sessions[index].get("agent_id", "")) != agent_id:
+	for index in range(_state.sessions.size()):
+		if str(_state.sessions[index].get("agent_id", "")) != agent_id:
 			continue
-		if str(sessions[index].get("remote_session_id", "")) == remote_session_id:
+		if str(_state.sessions[index].get("remote_session_id", "")) == remote_session_id:
 			return index
 	return -1
 
 
 func _find_latest_session_index_by_agent(agent_id: String) -> int:
-	for index in range(sessions.size() - 1, -1, -1):
-		if str(sessions[index].get("agent_id", "")) == agent_id:
+	for index in range(_state.sessions.size() - 1, -1, -1):
+		if str(_state.sessions[index].get("agent_id", "")) == agent_id:
 			return index
 	return -1
 
@@ -7122,9 +7024,9 @@ func _agent_label(agent_id: String) -> String:
 
 
 func _current_agent_id() -> String:
-	if current_session_index < 0 or current_session_index >= sessions.size():
-		return selected_agent_id
-	return str(sessions[current_session_index].get("agent_id", selected_agent_id))
+	if current_session_index < 0 or current_session_index >= _state.sessions.size():
+		return _state.selected_agent_id
+	return str(_state.sessions[current_session_index].get("agent_id", _state.selected_agent_id))
 
 
 func _on_thread_switcher_pressed() -> void:
@@ -7142,8 +7044,8 @@ func _on_add_menu_id_pressed(item_id: int) -> void:
 	if agent_index < 0 or agent_index >= AGENTS.size():
 		return
 
-	selected_agent_id = str(AGENTS[agent_index]["id"])
+	_state.selected_agent_id = str(AGENTS[agent_index]["id"])
 	_refresh_add_menu()
-	_create_session(selected_agent_id, true, true)
+	_create_session(_state.selected_agent_id, true, true)
 
 

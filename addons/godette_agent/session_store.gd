@@ -448,10 +448,16 @@ static func compact_transcript(transcript_variant) -> Array:
 		if typeof(entry_variant) != TYPE_DICTIONARY:
 			continue
 		var entry: Dictionary = entry_variant
+		# `content` is NOT truncated — long assistant responses (markdown
+		# bodies with tables / fenced code) easily exceed the old 2400-
+		# char cap, and the legacy reason for the cap (one giant index
+		# file) doesn't apply now that each thread has its own cache.
+		# Title / summary stay capped because they're chat-row labels
+		# meant to be short by definition.
 		var compact_entry: Dictionary = {
 			"speaker": str(entry.get("speaker", "System")),
 			"kind": str(entry.get("kind", "")),
-			"content": trim_persist_text(str(entry.get("content", "")), MAX_PERSISTED_ENTRY_CHARS)
+			"content": str(entry.get("content", "")),
 		}
 
 		var title: String = str(entry.get("title", ""))
@@ -460,7 +466,7 @@ static func compact_transcript(transcript_variant) -> Array:
 
 		var summary: String = str(entry.get("summary", ""))
 		if not summary.is_empty():
-			compact_entry["summary"] = trim_persist_text(summary, MAX_PERSISTED_ENTRY_CHARS)
+			compact_entry["summary"] = trim_persist_text(summary, MAX_PERSISTED_TITLE_CHARS)
 
 		var status: String = str(entry.get("status", ""))
 		if not status.is_empty():
