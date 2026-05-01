@@ -28,6 +28,11 @@ const ACPConnectionScript = preload("res://addons/godette_agent/acp_connection.g
 
 const STATE_PATH := "user://godette_sessions.json"
 const THREAD_CACHE_DIR := "user://godette_threads/"
+# Cumulative token usage counters (input / output / cache) since first
+# install. Lives in its own file so the session index doesn't grow with
+# unrelated telemetry, and so a corrupt index doesn't take token totals
+# down with it (and vice versa).
+const TOKEN_TOTALS_PATH := "user://godette_token_totals.json"
 
 # Upper bounds enforced at persist time so a single runaway session (or
 # a pathological tool-call output) can't bloat the on-disk footprint.
@@ -435,6 +440,59 @@ static func compact_plan_items(items_variant) -> Array:
 			"priority": str(item_dict.get("priority", ""))
 		})
 	return compacted_items
+
+
+# ---------------------------------------------------------------------------
+# Token totals I/O (user://godette_token_totals.json)
+# ---------------------------------------------------------------------------
+
+
+# Read cumulative token counters from disk. Returns a Dictionary with
+# the four counters; missing or malformed file → all zeros.
+static func load_token_totals() -> Dictionary:
+	var defaults := {
+		"total_input_tokens": 0,
+		"total_output_tokens": 0,
+		"total_cache_creation_tokens": 0,
+		"total_cache_read_tokens": 0,
+		"total_codex_tokens": 0,
+	}
+	if not FileAccess.file_exists(TOKEN_TOTALS_PATH):
+		return defaults
+	var file := FileAccess.open(TOKEN_TOTALS_PATH, FileAccess.READ)
+	if file == null:
+		return defaults
+	var raw_text: String = file.get_as_text()
+	if raw_text.strip_edges().is_empty():
+		return defaults
+	var parsed = JSON.parse_string(raw_text)
+	if typeof(parsed) != TYPE_DICTIONARY:
+		return defaults
+	var d: Dictionary = parsed
+	return {
+		"total_input_tokens": int(d.get("total_input_tokens", 0)),
+		"total_output_tokens": int(d.get("total_output_tokens", 0)),
+		"total_cache_creation_tokens": int(d.get("total_cache_creation_tokens", 0)),
+		"total_cache_read_tokens": int(d.get("total_cache_read_tokens", 0)),
+		"total_codex_tokens": int(d.get("total_codex_tokens", 0)),
+	}
+
+
+# Write cumulative token counters to disk. Atomic-enough — single
+# `store_string` + flush, file content is tiny (~150 bytes) so partial
+# writes are unlikely to leave it inconsistent.
+static func save_token_totals(totals: Dictionary) -> void:
+	var file := FileAccess.open(TOKEN_TOTALS_PATH, FileAccess.WRITE)
+	if file == null:
+		return
+	file.store_string(JSON.stringify({
+		"total_input_tokens": int(totals.get("total_input_tokens", 0)),
+		"total_output_tokens": int(totals.get("total_output_tokens", 0)),
+		"total_cache_creation_tokens": int(totals.get("total_cache_creation_tokens", 0)),
+		"total_cache_read_tokens": int(totals.get("total_cache_read_tokens", 0)),
+		"total_codex_tokens": int(totals.get("total_codex_tokens", 0)),
+	}))
+	file.flush()
 
 
 static func compact_transcript(transcript_variant) -> Array:

@@ -32,6 +32,32 @@ var sessions: Array = []
 var next_session_number: int = 1
 var selected_agent_id: String = DEFAULT_AGENT_ID
 
+# Global cumulative token counters since the user first installed
+# Godette. Persisted in the same index file as `next_session_number`,
+# so they survive editor restarts. Per-message breakdowns live on the
+# session itself (transcript / tool calls); these four are just the
+# running totals across every session, every agent, every model.
+var total_input_tokens: int = 0
+var total_output_tokens: int = 0
+var total_cache_creation_tokens: int = 0  # Claude prompt-cache writes
+var total_cache_read_tokens: int = 0      # Claude prompt-cache hits
+# Codex-acp's token wire only carries one undifferentiated `used`
+# number per session/update notification — no input/output/cache
+# breakdown. Tracked in its own bucket so it doesn't muddy the Claude
+# counters (those drive the widget's hot/cold colour blend, which is a
+# cache-read ratio that only makes sense for Claude). The widget sums
+# all five buckets when rendering the total so the user still sees one
+# combined "tokens consumed" figure.
+var total_codex_tokens: int = 0
+
+# Per-session "last seen `used` value" from codex-acp's session/update
+# usage_update notification. Codex reports CUMULATIVE session tokens (not
+# per-turn delta), so we diff against this snapshot to extract the delta
+# we should add to the global counter. Keyed by remote session id; not
+# persisted (a fresh editor launch starts each Codex session over from
+# scratch on its end too, since codex-acp doesn't restore prior context).
+var _codex_session_used_snapshots: Dictionary = {}
+
 var connections: Dictionary = {}                 # agent_id -> ACPConnection
 var connection_status: Dictionary = {}           # agent_id -> "connecting" / "ready" / etc.
 var pending_remote_sessions: Dictionary = {}     # agent_id -> [local_session_id, ...]
@@ -101,6 +127,8 @@ signal thinking_block_expanded_changed(key: String)
 signal plan_dismissed_changed(scope_key: String)
 
 signal surface_claims_changed                                            # any claim/release
+signal total_tokens_changed                                              # global cumulative counters bumped
+signal token_pulse_requested                                             # mid-stream usage_update (Balatro pulse trigger)
 
 
 # ---------------------------------------------------------------------------
@@ -880,6 +908,100 @@ func is_plan_dismissed(scope_key: String) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Token usage (global cumulative)
+# ---------------------------------------------------------------------------
+
+
+# Add the deltas from a single ACP turn's usage payload to the global
+# counters. Field names vary by adapter:
+#   - claude-agent-acp: inputTokens / outputTokens /
+#     cachedWriteTokens / cachedReadTokens / totalTokens (camelCase)
+#   - codex-acp: usage shape unknown for now — falls back to
+#     OpenAI's prompt_tokens / completion_tokens snake_case
+#   - Anthropic raw API: input_tokens / cache_*_input_tokens /
+#     output_tokens (snake_case, in case some path passes raw)
+# Unknown fields are ignored; missing fields count as 0. Persisted on
+# the next debounce tick along with the rest of the index file.
+func record_token_usage(usage: Dictionary) -> void:
+	if usage.is_empty():
+		return
+	var d_input: int = int(usage.get(
+		"inputTokens",
+		usage.get("input_tokens", usage.get("prompt_tokens", 0))
+	))
+	var d_output: int = int(usage.get(
+		"outputTokens",
+		usage.get("output_tokens", usage.get("completion_tokens", 0))
+	))
+	var d_cache_create: int = int(usage.get(
+		"cachedWriteTokens",
+		usage.get("cache_creation_input_tokens", 0)
+	))
+	var d_cache_read: int = int(usage.get(
+		"cachedReadTokens",
+		usage.get("cache_read_input_tokens", 0)
+	))
+	if d_input <= 0 and d_output <= 0 and d_cache_create <= 0 and d_cache_read <= 0:
+		return
+	total_input_tokens += max(0, d_input)
+	total_output_tokens += max(0, d_output)
+	total_cache_creation_tokens += max(0, d_cache_create)
+	total_cache_read_tokens += max(0, d_cache_read)
+	total_tokens_changed.emit()
+	# Token totals file is ~150 bytes — flush immediately rather than
+	# go through the session-index debounce. Decouples from streaming-
+	# gated persistence (which holds the index write off until busy
+	# clears) so a single turn's tokens land on disk right when the
+	# turn ends, regardless of what other sessions are doing.
+	_persist_token_totals()
+
+
+# All ACP adapters that report cumulative session token usage via
+# `session/update` `usage_update` notifications funnel into this same
+# delta-accumulator. Both Claude (each Anthropic API `message_delta`)
+# and Codex (each `TokenCountEvent`) emit cumulative session `used`
+# counts mid-turn — diffing against the per-session snapshot recovers
+# the increment and lets the widget number grow in real-time as the
+# agent generates, matching what the official CLI shows.
+#
+# We accumulate into `total_codex_tokens` purely for naming inertia —
+# the bucket is now adapter-agnostic, but renaming would force a
+# persistence migration. Treat the field as "real-time `used`-derived
+# tokens from any adapter".
+#
+# Snapshot keyed by `adapter|session_id` so two adapters opening
+# overlapping sessions don't collide.
+func record_session_token_snapshot(adapter_id: String, remote_session_id: String, used: int) -> void:
+	if used < 0:
+		return
+	var key: String = adapter_id + "|" + remote_session_id
+	var prev_used: int = int(_codex_session_used_snapshots.get(key, 0))
+	# `used` resets to 0 after a `/compact` style session reset — treat
+	# negative delta as "nothing to add" so the global counter doesn't
+	# silently roll back.
+	var delta: int = max(0, used - prev_used)
+	_codex_session_used_snapshots[key] = used
+	if delta <= 0:
+		return
+	total_codex_tokens += delta
+	total_tokens_changed.emit()
+	_persist_token_totals()
+
+
+# Single source of truth for the token-totals persistence payload — both
+# Claude and Codex paths funnel through this so adding a new bucket
+# doesn't risk one path dropping the field while the other writes it.
+func _persist_token_totals() -> void:
+	SessionStoreScript.save_token_totals({
+		"total_input_tokens": total_input_tokens,
+		"total_output_tokens": total_output_tokens,
+		"total_cache_creation_tokens": total_cache_creation_tokens,
+		"total_cache_read_tokens": total_cache_read_tokens,
+		"total_codex_tokens": total_codex_tokens,
+	})
+
+
+# ---------------------------------------------------------------------------
 # Connections + permissions
 # ---------------------------------------------------------------------------
 
@@ -981,6 +1103,17 @@ func _flush_persist_state() -> void:
 # one-shot legacy migrations (cancel-message purge, derived-title
 # backfill) since those touch the same on-disk data.
 func restore_from_disk() -> bool:
+	# Token totals live in their own file independent of session
+	# state — load them up front so they survive even when sessions
+	# don't exist yet (fresh install, or index file deleted but
+	# token file kept).
+	var totals: Dictionary = SessionStoreScript.load_token_totals()
+	total_input_tokens = int(totals.get("total_input_tokens", 0))
+	total_output_tokens = int(totals.get("total_output_tokens", 0))
+	total_cache_creation_tokens = int(totals.get("total_cache_creation_tokens", 0))
+	total_cache_read_tokens = int(totals.get("total_cache_read_tokens", 0))
+	total_codex_tokens = int(totals.get("total_codex_tokens", 0))
+
 	var result: Dictionary = SessionStoreScript.load_persisted(DEFAULT_AGENT_ID)
 	if not bool(result.get("found", false)):
 		return false

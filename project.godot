@@ -20,6 +20,18 @@ config/icon="res://icon.svg"
 
 enabled=PackedStringArray("res://addons/godette_agent/plugin.cfg")
 
+[godette]
+
+token_flame/padding_x=0
+token_flame/padding_y=4
+token_flame/flame_overflow_top=60
+token_flame/font_size=32
+token_flame/corner_radius=8
+token_flame/bounce_peak_scale=250
+token_flame/quiver_amount=0
+token_flame/bounce_rotation_deg=30
+token_flame/count_up_duration_ms=15000
+
 [physics]
 
 3d/physics_engine="Jolt Physics"

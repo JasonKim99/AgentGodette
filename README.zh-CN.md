@@ -10,7 +10,9 @@
 
 ### Godot 编辑器内的 ACP Agent
 
-![License](https://img.shields.io/badge/license-MIT-green) ![Node.js](https://img.shields.io/badge/Node.js-18+-brightgreen?logo=nodedotjs&logoColor=white) ![ACP](https://img.shields.io/badge/protocol-ACP-8b5cf6) ![Version](https://img.shields.io/badge/version-0.5.0-blue)
+![License](https://img.shields.io/badge/license-MIT-green) ![Node.js](https://img.shields.io/badge/Node.js-18+-brightgreen?logo=nodedotjs&logoColor=white) ![ACP](https://img.shields.io/badge/protocol-ACP-8b5cf6) ![Version](https://img.shields.io/badge/version-0.6.0-blue)
+
+**[更新日志](CHANGELOG.zh-CN.md)** · [Issues](https://github.com/JasonKim99/AgentGodette/issues) · [Releases](https://github.com/JasonKim99/AgentGodette/releases)
 
 </div>
 
@@ -21,6 +23,10 @@
 **Plan · Queue · 场景节点焦点** —— agent 的 TodoWrite 计划面板折叠在 composer 上方，排队中的后续 prompt 夹在计划和输入框之间，在 SceneTree 里选中的任何节点会作为隐式上下文自动附加到发送中。
 
 <img width="3840" height="2076" alt="Plan drawer, Queue drawer, and SceneTree focus indicator" src="https://raw.githubusercontent.com/JasonKim99/AgentGodette/master/git_src/plan+queue+selectnode.png" />
+
+**Token 火焰徽章** —— Balatro 风格的累积 token 数字徽章，挂在 dock 顶端。从首次安装开始按项目持久记录消耗量；每次 adapter 推 mid-stream `usage_update` 都触发数字老虎机式 count-up 加上 Balatro flame shader 的火焰动画。点徽章弹出设置可以调主色、动画速度、数字爬升时长、pulse 节奏。
+
+https://github.com/user-attachments/assets/d366bfae-d72f-47c6-94e8-c1d31f29df22
 
 
 ## 是什么

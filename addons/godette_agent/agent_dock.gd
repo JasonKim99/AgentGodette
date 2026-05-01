@@ -26,6 +26,12 @@ const ComposerContextScript = preload("res://addons/godette_agent/composer_conte
 const ComposerPromptInputScript = preload("res://addons/godette_agent/composer_prompt_input.gd")
 const ComposerChipOverlayScript = preload("res://addons/godette_agent/composer_chip_overlay.gd")
 const ComposerSlashPopupScript = preload("res://addons/godette_agent/composer_slash_popup.gd")
+const TokenFlameWidgetScript = preload("res://addons/godette_agent/token_flame_widget.gd")
+const TokenFlameSettingsDialogScript = preload("res://addons/godette_agent/token_flame_settings_dialog.gd")
+# ProjectSettings key for the Balatro-style flame widget next to the +
+# button. Default true; users who want the dock minimal can flip this
+# off in Project Settings without touching code.
+const SETTING_SHOW_TOKEN_FLAME := "godette/ui/show_token_flame"
 const EditorTheme = preload("res://addons/godette_agent/editor_theme.gd")
 # Store pasted images under the addon itself so every generated attachment
 # stays in one predictable project-local place. Keep the directory visible
@@ -84,6 +90,12 @@ var thread_menu: Button
 var session_popup: GodetteSessionMenu
 var thread_switcher_button: Button
 var add_menu: MenuButton
+# Optional flame badge showing cumulative tokens used in this project.
+# Created in `_build_ui` only when the matching ProjectSetting is on.
+# Typed as Control rather than the concrete `GodetteTokenFlameWidget`
+# class_name so standalone --check-only doesn't trip on class registry
+# ordering.
+var token_flame_widget: Control
 var message_scroll: ScrollContainer
 var message_stream: GodetteVirtualFeed
 # Plan drawer sits above the composer, between the message feed and the
@@ -218,10 +230,40 @@ func configure(p_editor_interface: EditorInterface) -> void:
 # of `dock._state.sessions IS state._state.sessions`. Step-2-of-N of the state-extraction
 # refactor — once each call site is migrated to call state methods
 # directly, the dock-side aliases get deleted.
+# Pops the token-flame settings dialog. New dialog per click — frees
+# itself on hide via tree_exited so we don't accumulate hidden Window
+# nodes if the user opens / closes repeatedly.
+func _open_token_flame_settings() -> void:
+	if token_flame_widget == null:
+		return
+	var dialog := TokenFlameSettingsDialogScript.new()
+	add_child(dialog)
+	dialog.bind(token_flame_widget)
+	dialog.connect("close_requested", Callable(dialog, "queue_free"))
+	dialog.connect("confirmed", Callable(dialog, "queue_free"))
+	dialog.popup_centered()
+
+
+# Read the show_token_flame ProjectSetting, registering the default on
+# first access so the option appears in Project Settings → Godette
+# without requiring users to edit project.godot by hand.
+func _show_token_flame_setting() -> bool:
+	if not ProjectSettings.has_setting(SETTING_SHOW_TOKEN_FLAME):
+		ProjectSettings.set_setting(SETTING_SHOW_TOKEN_FLAME, true)
+		ProjectSettings.set_initial_value(SETTING_SHOW_TOKEN_FLAME, true)
+		ProjectSettings.add_property_info({
+			"name": SETTING_SHOW_TOKEN_FLAME,
+			"type": TYPE_BOOL,
+		})
+	return bool(ProjectSettings.get_setting(SETTING_SHOW_TOKEN_FLAME, true))
+
+
 func bind(p_state: GodetteState) -> void:
 	_state = p_state
 	if _state == null:
 		return
+	if token_flame_widget != null and token_flame_widget.has_method("bind_state"):
+		token_flame_widget.call("bind_state", _state)
 	# State already restored from disk in plugin._enter_tree, so the
 	# in-memory `_state.sessions` array we just aliased is fully populated.
 	# Pick the dock's initial active session from state's surface claim
@@ -398,6 +440,22 @@ func _build_ui() -> void:
 	EditorTheme.apply_icon_button_theme(add_menu, HEADER_AGENT_ICON_SIZE)
 	add_menu.get_popup().id_pressed.connect(Callable(self, "_on_add_menu_id_pressed"))
 	header_row.add_child(add_menu)
+
+	# Token flame badge — Balatro-style stepped flame + cumulative
+	# token count, wired to state's `total_tokens_changed` signal.
+	# Gated by ProjectSettings so users who want a minimal header can
+	# turn it off without code changes.
+	if _show_token_flame_setting():
+		token_flame_widget = TokenFlameWidgetScript.new()
+		token_flame_widget.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		# Click on widget → pop the settings dialog. The widget keeps
+		# zero knowledge of the dialog class — it just emits a signal.
+		token_flame_widget.connect("settings_requested", Callable(self, "_open_token_flame_settings"))
+		header_row.add_child(token_flame_widget)
+		# `_state` may already be bound (plugin.gd binds before
+		# add_control_to_dock fires this _ready chain); covers both orders.
+		if _state != null:
+			token_flame_widget.bind_state(_state)
 
 	# Context-attach toolbar (Current Scene / Selected Nodes / Selected Files /
 	# Clear Context) is hidden for now. The attach functions are still present
@@ -4121,6 +4179,18 @@ func _adapter_candidates(agent_id: String) -> Array:
 		var program_files := OS.get_environment("ProgramFiles").replace("\\", "/")
 		var npx_cmd := program_files.path_join("nodejs").path_join("npx.cmd")
 		if agent_id == "claude_agent":
+			# Anthropic's official `@agentclientprotocol/claude-agent-acp`
+			# is preferred — it tracks the Claude SDK closely (so model
+			# strings like "Opus 4.7" stay current) AND emits per-turn
+			# usage telemetry that Zed's adapter doesn't. Zed's
+			# `@zed-industries/claude-code-acp` is kept as a fallback for
+			# users who only have it installed.
+			var claude_global_cmd := npm_root.path_join("claude-agent-acp.cmd")
+			if not cmd_exe.is_empty() and FileAccess.file_exists(claude_global_cmd):
+				candidates.append({"path": cmd_exe, "args": PackedStringArray(["/d", "/c", claude_global_cmd])})
+			var claude_js := appdata.path_join("npm").path_join("node_modules").path_join("@agentclientprotocol").path_join("claude-agent-acp").path_join("dist").path_join("index.js")
+			if FileAccess.file_exists(claude_js):
+				candidates.append({"path": "node", "args": PackedStringArray([claude_js])})
 			var claude_code_global_cmd := npm_root.path_join("claude-code-acp.cmd")
 			if not cmd_exe.is_empty() and FileAccess.file_exists(claude_code_global_cmd):
 				candidates.append({"path": cmd_exe, "args": PackedStringArray(["/d", "/c", claude_code_global_cmd])})
@@ -4128,15 +4198,9 @@ func _adapter_candidates(agent_id: String) -> Array:
 			if FileAccess.file_exists(claude_code_js):
 				candidates.append({"path": "node", "args": PackedStringArray([claude_code_js])})
 			if not cmd_exe.is_empty() and FileAccess.file_exists(npx_cmd):
-				candidates.append({"path": cmd_exe, "args": PackedStringArray(["/d", "/c", npx_cmd, "-y", "@zed-industries/claude-code-acp@0.16.2"])})
-			var claude_global_cmd := npm_root.path_join("claude-agent-acp.cmd")
-			if not cmd_exe.is_empty() and FileAccess.file_exists(claude_global_cmd):
-				candidates.append({"path": cmd_exe, "args": PackedStringArray(["/d", "/c", claude_global_cmd])})
-			var claude_js := appdata.path_join("npm").path_join("node_modules").path_join("@agentclientprotocol").path_join("claude-agent-acp").path_join("dist").path_join("index.js")
-			if FileAccess.file_exists(claude_js):
-				candidates.append({"path": "node", "args": PackedStringArray([claude_js])})
-			if not cmd_exe.is_empty() and FileAccess.file_exists(npx_cmd):
 				candidates.append({"path": cmd_exe, "args": PackedStringArray(["/d", "/c", npx_cmd, "-y", "@agentclientprotocol/claude-agent-acp@0.31.0"])})
+			if not cmd_exe.is_empty() and FileAccess.file_exists(npx_cmd):
+				candidates.append({"path": cmd_exe, "args": PackedStringArray(["/d", "/c", npx_cmd, "-y", "@zed-industries/claude-code-acp@0.16.2"])})
 		else:
 			var codex_global_cmd := npm_root.path_join("codex-acp.cmd")
 			if not cmd_exe.is_empty() and FileAccess.file_exists(codex_global_cmd):
@@ -4149,10 +4213,12 @@ func _adapter_candidates(agent_id: String) -> Array:
 		return candidates
 
 	if agent_id == "claude_agent":
-		candidates.append({"path": "claude-code-acp", "args": PackedStringArray()})
-		candidates.append({"path": "npx", "args": PackedStringArray(["-y", "@zed-industries/claude-code-acp@0.16.2"])})
+		# Anthropic's official adapter first — tracks SDK closely +
+		# emits per-turn `usage` telemetry. Zed's wrapper is fallback.
 		candidates.append({"path": "claude-agent-acp", "args": PackedStringArray()})
+		candidates.append({"path": "claude-code-acp", "args": PackedStringArray()})
 		candidates.append({"path": "npx", "args": PackedStringArray(["-y", "@agentclientprotocol/claude-agent-acp@0.31.0"])})
+		candidates.append({"path": "npx", "args": PackedStringArray(["-y", "@zed-industries/claude-code-acp@0.16.2"])})
 	else:
 		candidates.append({"path": "codex-acp", "args": PackedStringArray()})
 		candidates.append({"path": "npx", "args": PackedStringArray(["-y", "@zed-industries/codex-acp@0.12.0"])})
@@ -4415,6 +4481,20 @@ func _on_connection_session_update(agent_id: String, remote_session_id: String, 
 			for cmd_variant in update.get("availableCommands", []):
 				if typeof(cmd_variant) == TYPE_DICTIONARY:
 					cmd_names.append(str(cmd_variant.get("name", "?")))
+		"usage_update":
+			# Both Claude and Codex emit cumulative-per-session `used`
+			# counts on every internal token-count event (Anthropic
+			# `message_delta` for Claude, `TokenCountEvent` for Codex).
+			# Frequency is ~100-200ms during active generation. Diff
+			# the cumulative against our per-session snapshot to get
+			# the increment, accumulate into the global counter for
+			# real-time display, AND fire a pulse for the animation.
+			var used_variant = update.get("used", null)
+			if typeof(used_variant) == TYPE_INT or typeof(used_variant) == TYPE_FLOAT:
+				_state.record_session_token_snapshot(
+					agent_id, remote_session_id, int(used_variant)
+				)
+			_state.token_pulse_requested.emit()
 		_:
 			pass
 
@@ -4434,6 +4514,13 @@ func _on_connection_prompt_finished(agent_id: String, remote_session_id: String,
 	session["assistant_entry_index"] = -1
 	_state.sessions[session_index] = session
 	_state.set_session_busy(session_index, false)
+
+	# Token totals are now driven entirely by mid-stream `usage_update`
+	# notifications via `record_session_token_snapshot` — see the
+	# usage_update branch in `_on_connection_session_update`. The
+	# turn-end `result.usage` payload covers the same tokens that the
+	# mid-stream snapshots have already accumulated, so processing it
+	# here would double-count. We deliberately ignore it.
 
 	# Silently swallow normal terminations and user-initiated cancels —
 	# Zed's thread view does the same (no "Turn cancelled" system

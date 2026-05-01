@@ -10,7 +10,9 @@ English | [简体中文](README.zh-CN.md)
 
 ### ACP Agent in the Godot Editor
 
-![License](https://img.shields.io/badge/license-MIT-green) ![Node.js](https://img.shields.io/badge/Node.js-18+-brightgreen?logo=nodedotjs&logoColor=white) ![ACP](https://img.shields.io/badge/protocol-ACP-8b5cf6) ![Version](https://img.shields.io/badge/version-0.5.0-blue)
+![License](https://img.shields.io/badge/license-MIT-green) ![Node.js](https://img.shields.io/badge/Node.js-18+-brightgreen?logo=nodedotjs&logoColor=white) ![ACP](https://img.shields.io/badge/protocol-ACP-8b5cf6) ![Version](https://img.shields.io/badge/version-0.6.0-blue)
+
+**[Changelog](CHANGELOG.md)** · [Issues](https://github.com/JasonKim99/AgentGodette/issues) · [Releases](https://github.com/JasonKim99/AgentGodette/releases)
 
 </div>
 
@@ -21,6 +23,10 @@ English | [简体中文](README.zh-CN.md)
 **Plan · Queue · SceneTree focus** — the agent's TodoWrite plan collapses above the composer, queued follow-up prompts stack underneath it, and any node you've selected in the SceneTree auto-attaches as implicit context on send.
 
 <img width="3840" height="2076" alt="Plan drawer, Queue drawer, and SceneTree focus indicator" src="https://raw.githubusercontent.com/JasonKim99/AgentGodette/master/git_src/plan+queue+selectnode.png" />
+
+**Token flame** — Balatro-inspired count-up badge in the dock header. Tracks cumulative tokens since first install (per project), animates a slot-machine count-up + flame shader on every mid-stream `usage_update` from the adapter. Click the widget to tweak colour, animation speed, count-up duration, and pulse cadence.
+
+https://github.com/user-attachments/assets/d366bfae-d72f-47c6-94e8-c1d31f29df22
 
 
 ## What it is

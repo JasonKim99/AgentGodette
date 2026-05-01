@@ -38,3 +38,7 @@ desktop.ini
 /addons/godette_agent/attachments/*
 !/addons/godette_agent/attachments/.gitignore
 !/addons/godette_agent/attachments/.gdignore
+
+# Demo videos for the README — host on GitHub user-attachments / external
+# CDN so the repo stays lean. Static images in git_src/ stay tracked.
+/git_src/*.mp4
