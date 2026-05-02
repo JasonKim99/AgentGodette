@@ -2922,15 +2922,20 @@ func _user_prompt_style() -> StyleBoxFlat:
 	# give the user bubble its own presence against surrounding feed chrome.
 	var base := EditorTheme.color("base_color", "Editor", Color(0.16, 0.17, 0.19, 1.0))
 	style.bg_color = base.darkened(0.25)
-	var accent := EditorTheme.color("accent_color", "Editor", Color(0.48, 0.52, 0.60, 1.0))
 	style.border_width_left = 1
 	style.border_width_top = 1
 	style.border_width_right = 1
 	style.border_width_bottom = 1
-	# Use accent at low opacity — gives the bubble a subtle, themed outline
-	# without screaming for attention like editor buttons do.
-	var border := accent
-	border.a = 0.35
+	# Border uses the editor's "string placeholder" syntax-highlight
+	# colour — the warm orange used for `%s` / `{0}` previews in code
+	# editor. Distinguishes user prompts from agent responses without
+	# fighting the editor's own accent colour. Pull from EditorSettings
+	# so the border tracks user theme tweaks.
+	var border := EditorTheme.editor_settings_color(
+		"text_editor/theme/highlighting/string_placeholder_color",
+		Color(0.98, 0.74, 0.45, 1.0)  # fallback warm orange
+	)
+	border.a = 0.6
 	style.border_color = border
 	style.corner_radius_top_left = 6
 	style.corner_radius_top_right = 6

@@ -93,6 +93,23 @@ static func color(name: String, type_name: String, fallback: Color) -> Color:
 	return fallback
 
 
+# Read a Color from EditorSettings (text editor / syntax highlighting
+# colours live there, not in the editor Theme). Returns `fallback`
+# outside the editor or when the key is missing.
+static func editor_settings_color(setting_key: String, fallback: Color) -> Color:
+	if not Engine.is_editor_hint():
+		return fallback
+	var settings := EditorInterface.get_editor_settings()
+	if settings == null:
+		return fallback
+	if not settings.has_setting(setting_key):
+		return fallback
+	var v = settings.get_setting(setting_key)
+	if v is Color:
+		return v
+	return fallback
+
+
 static func theme_icon(icon_name: String) -> Texture2D:
 	if not Engine.is_editor_hint():
 		return null
