@@ -42,6 +42,15 @@ const float PIXEL_SIZE_FAC = 30.0;
 
 
 void fragment() {
+	// Early-return at zero / near-zero intensity. Balatro's original
+	// `flame.fs` does the same — when there's no fire to draw, skip
+	// the entire warp + colour pipeline. For us this maps to "0 token
+	// consumption → no flame" so a fresh install shows just the body
+	// card without any wisps.
+	if (flame_intensity < 0.1) {
+		COLOR = vec4(0.0, 0.0, 0.0, 0.0);
+	} else {
+
 	vec2 uv = UV;
 
 	// Centre the coordinate system on the flame's base. uv_centred.y
@@ -161,4 +170,6 @@ void fragment() {
 
 	COLOR.rgb = flame_rgb;
 	COLOR.a = flame_alpha * coverage;
+
+	}  // end of `else` (flame_intensity >= 0.1)
 }
